@@ -1,0 +1,2130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0e1117; font-family: 'Outfit', sans-serif; overflow: hidden; }
+  #container { position: relative; width: 100%; height: __HEIGHT__px; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #controls {
+    position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(30,41,59,0.92); border: 1px solid rgba(100,116,139,0.3);
+    border-radius: 10px; padding: 8px 16px; backdrop-filter: blur(8px);
+  }
+  #controls button {
+    background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.3);
+    color: #4ade80; border-radius: 6px; padding: 4px 12px; cursor: pointer;
+    font-size: 13px; font-weight: 600;
+  }
+  #controls button:hover { background: rgba(74,222,128,0.3); }
+  #scrubber { width: 180px; accent-color: #4ade80; cursor: pointer; }
+  #frame-label { color: #94a3b8; font-size: 12px; min-width: 70px; text-align: center; }
+  #phase-badge {
+    padding: 2px 10px; border-radius: 6px; font-size: 11px; font-weight: 600;
+    min-width: 90px; text-align: center;
+  }
+  #speed-select {
+    background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+    border-radius: 4px; padding: 2px 6px; font-size: 12px;
+  }
+
+  /* Comparison mode labels */
+  .viewport-label {
+    position: absolute; top: 10px; color: rgba(148,163,184,0.8);
+    font-size: 13px; font-weight: 600; letter-spacing: 0.5px;
+    pointer-events: none;
+  }
+  #label-left { left: 15px; }
+  #label-right { right: 15px; }
+
+  /* Loading overlay */
+  #loading {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: #4ade80; font-size: 15px; font-weight: 600; letter-spacing: 0.5px;
+    background: rgba(14,17,23,0.85); padding: 12px 24px; border-radius: 8px;
+    border: 1px solid rgba(74,222,128,0.3); pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="viewer"></canvas>
+  <div id="loading">Loading 3D model…</div>
+  <div id="controls">
+    <button id="play-btn">Play</button>
+    <input id="scrubber" type="range" min="0" max="100" value="0">
+    <span id="frame-label">0 / 0</span>
+    <span id="phase-badge"></span>
+    <select id="speed-select">
+      <option value="0.25">0.25x</option>
+      <option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+    </select>
+    <button id="reset-cam-btn">Reset Cam</button>
+  </div>
+  <span id="label-left" class="viewport-label" style="display:none;">Student</span>
+  <span id="label-right" class="viewport-label" style="display:none;">Pro</span>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+// ── Injected data ──
+const poseData = __POSE_DATA__;
+const clubData = __CLUB_DATA__;
+const phaseData = __PHASE_DATA__;
+const phaseColors = __PHASE_COLORS__;
+const MODE = "__MODE__";
+const comparisonPose = __COMPARISON_POSE__;
+const comparisonClub = __COMPARISON_CLUB__;
+const dtwAlignment = __DTW_ALIGNMENT__;
+const comparisonPhaseData = __COMPARISON_PHASE_DATA__;
+
+const TOTAL = poseData.length;
+const MODEL_URL = "__MODEL_URL__";
+
+// How far the butt of the club sticks out past the topmost hand, in metres.
+// The club estimator reports "grip" as the wrist midpoint, which is a couple
+// of centimetres down from where a real club actually ends.
+const BUTT_CAP_M = 0.04;
+
+// ── Scene setup ──
+const canvas = document.getElementById('viewer');
+const container = document.getElementById('container');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.setClearColor(0x0e1117);
+renderer.shadowMap.enabled = true;
+
+const isComparison = MODE === 'comparison' && comparisonPose && comparisonPose.length > 0;
+
+// Camera & controls. Framed like the 50° camera 3 m out it replaced, but from
+// 2.4× as far with a correspondingly narrow lens, as a face-on swing video is
+// shot from well back and zoomed in. Up close, anything a metre nearer the
+// lens looked ~1.6× bigger: a club the video shows pointing toward the camera
+// at half its length on screen through the finish (TigerWoodsDriver.mov
+// ~650–690) still reached the ground.
+const CAM_FOV = 22;
+const CAM_POS = [0, 0.08, 7.2];
+const CAM_TARGET = [0, 0.8, 0];
+const camera = new THREE.PerspectiveCamera(CAM_FOV, container.clientWidth / container.clientHeight, 0.01, 50);
+camera.position.set(...CAM_POS);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(...CAM_TARGET);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.update();
+
+// Second camera for comparison
+let camera2, controls2;
+if (isComparison) {
+  camera2 = new THREE.PerspectiveCamera(CAM_FOV, (container.clientWidth / 2) / container.clientHeight, 0.01, 50);
+  camera2.position.set(...CAM_POS);
+  controls2 = new OrbitControls(camera2, canvas);
+  controls2.target.set(...CAM_TARGET);
+  controls2.enableDamping = true;
+  controls2.dampingFactor = 0.08;
+  controls2.update();
+  document.getElementById('label-left').style.display = 'block';
+  document.getElementById('label-right').style.display = 'block';
+}
+
+// ── Scene infrastructure (lights, grid, club, trail) ──
+function createSceneInfrastructure() {
+  const scene = new THREE.Scene();
+
+  // Lighting
+  const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+  scene.add(ambient);
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+  dirLight.position.set(3, 5, 3);
+  dirLight.castShadow = true;
+  dirLight.shadow.mapSize.set(1024, 1024);
+  scene.add(dirLight);
+  const fillLight = new THREE.DirectionalLight(0x8080ff, 0.3);
+  fillLight.position.set(-3, 2, -2);
+  scene.add(fillLight);
+
+  // Ground grid (Y-position adjusted after model loads to align with feet)
+  const grid = new THREE.GridHelper(6, 30, 0x334155, 0x1e293b);
+  scene.add(grid);
+
+  // Club shaft
+  const shaftGeo = new THREE.CylinderGeometry(0.008, 0.008, 1, 8);
+  shaftGeo.translate(0, 0.5, 0);
+  const shaftMat = new THREE.MeshPhongMaterial({ color: 0xc0c0c0 });
+  const shaft = new THREE.Mesh(shaftGeo, shaftMat);
+  shaft.visible = false;
+  scene.add(shaft);
+
+  // Clubhead
+  const headGeo = new THREE.BoxGeometry(0.06, 0.02, 0.04);
+  const headMat = new THREE.MeshPhongMaterial({ color: 0x888888 });
+  const clubhead = new THREE.Mesh(headGeo, headMat);
+  clubhead.visible = false;
+  scene.add(clubhead);
+
+  // Swing trail
+  const trailMax = 40;
+  const trailPositions = new Float32Array(trailMax * 3);
+  const trailGeo = new THREE.BufferGeometry();
+  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3));
+  trailGeo.setDrawRange(0, 0);
+  const trailMat = new THREE.LineBasicMaterial({ color: 0xfb5607, transparent: true, opacity: 0.7 });
+  const trail = new THREE.Line(trailGeo, trailMat);
+  scene.add(trail);
+
+  return {
+    scene,
+    soldierModel: null,
+    soldierBones: {},
+    hipRestY: 0,
+    grid,
+    shaft, clubhead, trail, trailPositions,
+    trailCount: 0, trailMax,
+  };
+}
+
+const mainScene = createSceneInfrastructure();
+let compScene = null;
+if (isComparison) compScene = createSceneInfrastructure();
+mainScene.leadSide = leadRigSide(poseData, clubData);
+if (compScene) compScene.leadSide = leadRigSide(comparisonPose, comparisonClub);
+
+// ── Bone retargeting data (populated once after GLB load) ──
+const restAxis = {};    // boneName → Vector3 (world rest direction bone→firstChild)
+const restWorldQ = {};  // boneName → Quaternion (bone world quaternion at rest)
+const restLocalQ = {};  // boneName → Quaternion (bone local rest quaternion, for finger curl)
+const tunnelOffset = {}; // handBoneName → Vector3 (local offset from wrist to the "grip tunnel"
+                          // formed once fingers curl — used so the shaft lines up with the
+                          // curled fist instead of the bare wrist pivot)
+const restHandFrame = {}; // handBoneName → { shaft, knuckle } — the hand's own anatomy, in
+                          // WORLD directions at rest. `shaft` runs pinky-knuckle → index-knuckle
+                          // (the line a club actually lies along where it crosses the palm) and
+                          // `knuckle` runs wrist → knuckles. Both are MEASURED off the rig rather
+                          // than assumed from Mixamo's axis conventions, so the grip can be posed
+                          // by naming anatomy instead of guessing which local axis is which.
+const restForearmLenWorld = {}; // foreArmBoneName → number (elbow→wrist rest distance, WORLD
+                                 // units). bone.position.length() is in the bone's own raw local
+                                 // space, unscaled by the ~0.01 ancestor scale baked into this
+                                 // GLB — using it directly as a world length makes every stretch
+                                 // ratio ~100x too small. Cache the properly-scaled version once.
+const restUpperLenWorld = {};   // armBoneName → number (shoulder→elbow rest distance, WORLD units)
+
+// Auto-detected Mixamo bone prefix ('mixamorig:' or 'mixamorig' etc.)
+let MIXAMO_PREFIX = 'mixamorig:';
+// Helper: resolve full bone name from short suffix
+function B(suffix) { return MIXAMO_PREFIX + suffix; }
+
+function cacheRestData(model) {
+  model.updateMatrixWorld(true);
+  model.traverse(obj => {
+    if (!obj.isBone || restAxis[obj.name]) return; // only cache once
+    const wq = new THREE.Quaternion();
+    obj.getWorldQuaternion(wq);
+    restWorldQ[obj.name] = wq.clone();
+    restLocalQ[obj.name] = obj.quaternion.clone();
+
+    const boneKids = obj.children.filter(c => c.isBone);
+    if (boneKids.length > 0) {
+      const bp = new THREE.Vector3(), cp = new THREE.Vector3();
+      obj.getWorldPosition(bp);
+      boneKids[0].getWorldPosition(cp);
+      const d = cp.clone().sub(bp);
+      restAxis[obj.name] = d.lengthSq() > 1e-10 ? d.normalize() : new THREE.Vector3(0, 1, 0);
+    } else {
+      restAxis[obj.name] = new THREE.Vector3(0, 1, 0);
+    }
+  });
+}
+
+// Cache each hand's wrist→"grip tunnel" offset (in the hand bone's own local
+// space, pre-scaled to world units) using the middle finger's knuckle as a
+// stand-in for where a curled hand actually closes around a shaft. A club is
+// held across the PALM, near the knuckles — not at the wrist pivot — so this
+// offset is most of the way out to the knuckle. It used to be kept down at
+// 0.35 because the forearm had a fixed rest length and moving the wrist that
+// far opened a gap at the joint; stretchForearmToTarget now takes up the
+// slack, so the hand can sit where it really would and the fingers curl
+// around the shaft instead of around empty air next to it. Must run after
+// cacheRestData so MIXAMO_PREFIX and rest world transforms are resolved.
+const TUNNEL_OFFSET_FACTOR = 0.85;
+function cacheHandTunnelOffsets(model) {
+  const bones = buildBoneMap(model);
+  const wp = b => b.getWorldPosition(new THREE.Vector3());
+  ['Left', 'Right'].forEach(side => {
+    const handBone = bones[B(side + 'Hand')];
+    const foreArmBone = bones[B(side + 'ForeArm')];
+    const midBone   = bones[B(side + 'HandMiddle1')];
+    const idxBone   = bones[B(side + 'HandIndex1')];
+    const pinkyBone = bones[B(side + 'HandPinky1')];
+    if (!handBone || !midBone) return;
+    const worldPos = wp(midBone);
+    const localOffset = handBone.worldToLocal(worldPos.clone());
+    const scale = handBone.getWorldScale(new THREE.Vector3()).x;
+    tunnelOffset[B(side + 'Hand')] = localOffset.multiplyScalar(scale * TUNNEL_OFFSET_FACTOR);
+
+    // Measure the hand's own anatomy off the rig (see restHandFrame).
+    if (idxBone && pinkyBone) {
+      const shaftAxis = wp(idxBone).sub(wp(pinkyBone));
+      const knuckle   = wp(midBone).sub(wp(handBone));
+      if (shaftAxis.lengthSq() > 1e-12 && knuckle.lengthSq() > 1e-12) {
+        restHandFrame[B(side + 'Hand')] = {
+          shaft:   shaftAxis.normalize(),
+          knuckle: knuckle.normalize(),
+        };
+      }
+    }
+
+    if (foreArmBone) {
+      restForearmLenWorld[B(side + 'ForeArm')] = wp(foreArmBone).distanceTo(wp(handBone));
+      const armBone = bones[B(side + 'Arm')];
+      if (armBone) restUpperLenWorld[B(side + 'Arm')] = wp(armBone).distanceTo(wp(foreArmBone));
+    }
+    if (idxBone && pinkyBone) {
+      gripSpacing = Math.max(gripSpacing,
+        wp(idxBone).distanceTo(wp(pinkyBone)) * GRIP_SPACING_FACTOR);
+    }
+  });
+}
+
+function buildBoneMap(model) {
+  const bones = {};
+  model.traverse(obj => { if (obj.isBone) bones[obj.name] = obj; });
+  return bones;
+}
+
+// Apply a world-space quaternion to a bone (converts to local space)
+function setBoneWorldQ(bone, worldQ) {
+  const parentWorldQ = new THREE.Quaternion();
+  if (bone.parent) bone.parent.getWorldQuaternion(parentWorldQ);
+  bone.quaternion.copy(parentWorldQ.clone().invert().multiply(worldQ));
+}
+
+// The rig's hip-joint line at rest (WORLD direction RightUpLeg → LeftUpLeg
+// heads, i.e. subject's left hip → right hip after the 180° turn). The Hips
+// bone has three children, so restAxis (bone → FIRST child) can't stand in
+// for the pelvis's left-right axis.
+let restPelvisAxis = null;
+function cachePelvisAxis(model) {
+  const bones = buildBoneMap(model);
+  const l = bones[B('LeftUpLeg')], r = bones[B('RightUpLeg')];
+  if (!l || !r) return;
+  const d = l.getWorldPosition(new THREE.Vector3())
+    .sub(r.getWorldPosition(new THREE.Vector3()));
+  if (d.lengthSq() > 1e-10) restPelvisAxis = d.normalize();
+}
+
+// Turn the pelvis so its hip-joint line follows the measured hip line
+// (hipLine = lm24 - lm23, subject's left → right hip). Without this the Hips
+// bone keeps its rest orientation and the pelvis never turns, however the
+// legs and spine above and below it move.
+function drivePelvis(bones, hipLine) {
+  const bone = bones[B('Hips')];
+  const rWorldQ = restWorldQ[B('Hips')];
+  if (!bone || !rWorldQ || !restPelvisAxis || hipLine.lengthSq() < 1e-8) return;
+  const R = new THREE.Quaternion().setFromUnitVectors(restPelvisAxis, hipLine.clone().normalize());
+  setBoneWorldQ(bone, rWorldQ.clone().premultiply(R));
+  bone.updateMatrix();
+  bone.updateMatrixWorld(true);
+}
+
+// Like driveBone, but also rolls the bone about its own length so the rig's
+// left→right line (restPelvisAxis at rest; the chest's is parallel to it)
+// follows `side`. driveBone's minimal rotation never rolls, so a spine driven
+// with it keeps the chest facing the camera however far the shoulders turn.
+function driveBoneTwisted(bones, boneName, targetDir, side) {
+  const bone = bones[boneName];
+  const rAxis = restAxis[boneName];
+  const rWorldQ = restWorldQ[boneName];
+  if (!bone || !rAxis || !rWorldQ || !restPelvisAxis || targetDir.lengthSq() < 1e-8) return;
+
+  const td = targetDir.clone().normalize();
+  const R = new THREE.Quaternion().setFromUnitVectors(rAxis, td);
+  // Where aiming alone leaves the left→right line, and where it should be,
+  // both flattened square to the bone, so the correction is a pure roll.
+  const have = restPelvisAxis.clone().applyQuaternion(R).projectOnPlane(td);
+  const want = side.clone().projectOnPlane(td);
+  if (have.lengthSq() > 1e-8 && want.lengthSq() > 1e-8) {
+    R.premultiply(new THREE.Quaternion().setFromUnitVectors(have.normalize(), want.normalize()));
+  }
+  setBoneWorldQ(bone, rWorldQ.clone().premultiply(R));
+  bone.updateMatrix();
+  bone.updateMatrixWorld(true);
+}
+
+// Drive a bone so it points from fromDir toward toDir (targetDir = to - from)
+function driveBone(bones, boneName, targetDir) {
+  const bone = bones[boneName];
+  const rAxis = restAxis[boneName];
+  const rWorldQ = restWorldQ[boneName];
+  if (!bone || !rAxis || !rWorldQ || targetDir.lengthSq() < 1e-8) return;
+
+  const td = targetDir.clone().normalize();
+  // Rotate restAxis → td in world space, applied on top of rest world quaternion
+  const R = new THREE.Quaternion().setFromUnitVectors(rAxis, td);
+  const desiredWorldQ = rWorldQ.clone().premultiply(R); // R * rWorldQ
+  setBoneWorldQ(bone, desiredWorldQ);
+  bone.updateMatrix(); // sync matrix from new quaternion (handles matrixAutoUpdate=false)
+  bone.updateMatrixWorld(true);
+}
+
+// Curl a hand's fingers around the shaft. Mixamo hand bones are rigged with
+// the finger's own length along local +X and the knuckle-to-knuckle row along
+// local Z, so a rotation about local Z sweeps the fingertip from "pointing
+// out" (+X) toward the palm — i.e. a natural curl. The right hand's
+// finger-length axis points along -X instead of +X (mirrored rig), so its curl
+// sign is flipped to close in the same physical direction as the left hand.
+//
+// The three knuckles get DIFFERENT angles. A hand closing on a golf grip is
+// not a fist: the shaft holds the base joints open while the middle and tip
+// joints fold right around it, so a single angle repeated down the chain
+// either leaves the fingers splayed off the shaft or curls the base so far
+// that the fingertips drive back through the palm.
+const GRIP_FINGERS = ['Index', 'Middle', 'Ring', 'Pinky'];
+const GRIP_CURL_DEG = [52, 78, 55];  // base, middle, tip
+// The thumbs do not curl at all — on a golf grip they lie ALONG the shaft
+// pointing at the clubhead (the trail hand's palm then covers the lead thumb),
+// which is most of what makes a golf grip read as a golf grip rather than as
+// two fists. Only a slight bend at the knuckles.
+const THUMB_BEND_DEG = [0, 14, 10];
+function curlFingers(bones, side, amount) {
+  const sign = side === 'Left' ? 1 : -1;
+  const setCurl = (finger, degrees) => {
+    for (let i = 1; i <= 3; i++) {
+      const name = B(side + 'Hand' + finger + i);
+      const bone = bones[name];
+      const rest = restLocalQ[name];
+      if (!bone || !rest) continue;
+      const q = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 0, 1),
+        THREE.MathUtils.degToRad(sign * degrees[i - 1] * amount));
+      bone.quaternion.copy(rest.clone().multiply(q));
+      bone.updateMatrix();
+      bone.updateMatrixWorld(true);
+    }
+  };
+  GRIP_FINGERS.forEach(finger => setCurl(finger, GRIP_CURL_DEG));
+  setCurl('Thumb', THUMB_BEND_DEG);
+}
+
+// Lay the thumb down the shaft toward the clubhead. Runs after the hand is
+// oriented, so it only has to fix the thumb's direction; the small bend from
+// curlFingers stays on the joints below it.
+//
+// The thumb is aimed at a point ON the shaft one thumb-length further down it,
+// not simply pointed in the shaft's direction: the thumb's knuckle sits off to
+// the side of the palm, so merely matching the direction leaves it running
+// parallel to the club a few centimetres clear of it — two thumbs sticking up
+// in the air. Converging on the shaft makes it lie along the grip.
+function layThumbAlongShaft(bones, side, gripPoint, shaftUnit) {
+  const name = B(side + 'HandThumb1');
+  const bone = bones[name];
+  const tip = bones[B(side + 'HandThumb4')];
+  if (!bone || !tip) return;
+  const base = bone.getWorldPosition(new THREE.Vector3());
+  const reach = base.distanceTo(tip.getWorldPosition(new THREE.Vector3()));
+  const t = base.clone().sub(gripPoint).dot(shaftUnit);
+  const target = gripPoint.clone().addScaledVector(shaftUnit, t + reach);
+  driveBone(bones, name, target.sub(base));
+}
+
+// Build the world quaternion that carries a hand's rest anatomy onto a target
+// orientation: `shaftDir` is where the club crosses the palm, `knuckleDir` is
+// where the knuckles sit relative to the wrist (which fixes the roll AROUND
+// the shaft — the one thing aligning a single axis leaves undetermined, and
+// the reason hands used to end up gripping at arbitrary angles).
+function orthoFrame(primary, secondary) {
+  const x = primary.clone().normalize();
+  let y = secondary.clone().sub(x.clone().multiplyScalar(secondary.dot(x)));
+  if (y.lengthSq() < 1e-10) {
+    // Degenerate: pick any direction off the primary axis.
+    y = new THREE.Vector3(0, 1, 0).sub(x.clone().multiplyScalar(x.y));
+    if (y.lengthSq() < 1e-10) y = new THREE.Vector3(1, 0, 0).sub(x.clone().multiplyScalar(x.x));
+  }
+  y.normalize();
+  const z = new THREE.Vector3().crossVectors(x, y);
+  return new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(x, y, z));
+}
+
+function gripHandWorldQuat(side, shaftDir, knuckleDir) {
+  const handName = B(side + 'Hand');
+  const rWorldQ = restWorldQ[handName];
+  const rest = restHandFrame[handName];
+  if (!rWorldQ || !rest || shaftDir.lengthSq() < 1e-8) return null;
+  const kd = (knuckleDir && knuckleDir.lengthSq() > 1e-8) ? knuckleDir : rest.knuckle;
+  const qRest   = orthoFrame(rest.shaft, rest.knuckle);
+  const qTarget = orthoFrame(shaftDir, kd);
+  // World-space rotation taking the rest anatomy onto the target anatomy,
+  // then applied on top of the hand's rest orientation.
+  return qTarget.clone().multiply(qRest.invert()).multiply(rWorldQ);
+}
+
+// Where the wrist pivot should sit so the curled-finger "tunnel" (cached in
+// tunnelOffset), not the bare wrist, lands on the grip point. Computed
+// up front (before the forearm chain is driven) so the forearm can aim at
+// this SAME point instead of the raw grip — otherwise the forearm's fixed
+// rest length reaches toward one point while the wrist gets pinned to a
+// different one, tearing the mesh apart at the wrist.
+function gripWristTarget(side, gripVec, shaftDir, knuckleDir) {
+  const offset = tunnelOffset[B(side + 'Hand')];
+  const worldQ = gripHandWorldQuat(side, shaftDir, knuckleDir);
+  if (!offset || !worldQ) return gripVec;
+  return gripVec.clone().sub(offset.clone().applyQuaternion(worldQ));
+}
+
+// Where each hand sits ALONG the shaft. A golf grip is a fixed arrangement:
+// the lead hand on top, the trail hand directly below it, the two touching
+// (the trail pinky interlocks with or overlaps the lead index finger). Each
+// hand used to ride the shaft at its own wrist landmark's projection, but
+// MediaPipe's two 3D wrists wander 10+ cm apart along the club while the
+// hands are locked together — on TigerWoodsDriver.mov the right hand slid
+// 13–18 cm down the shaft through the takeaway and finished ABOVE the left
+// hand by frame 260. So the hands are laid out the way a grip is: centred on
+// the grip point, one hand-width apart, lead hand toward the butt.
+// GRIP_SPACING_FACTOR × the rig's knuckle-row width is the centre-to-centre
+// gap: a full hand's width less the interlock.
+const GRIP_SPACING_FACTOR = 1.15;
+let gripSpacing = 0;
+function gripHandPoints(gripVec, shaftUnit, leadSide) {
+  const half = gripSpacing / 2;
+  const trailSide = leadSide === 'Left' ? 'Right' : 'Left';
+  return {
+    [leadSide]:  gripVec.clone().addScaledVector(shaftUnit, -half),
+    [trailSide]: gripVec.clone().addScaledVector(shaftUnit,  half),
+  };
+}
+
+// Which of the rig's hands is the lead (top) hand on the club, decided once per
+// clip: the hand whose wrist landmark is nearer the butt on most frames. Too
+// noisy to trust frame by frame (see gripHandPoints), but a clear majority
+// over a whole swing. Defaults to a right-handed golfer (lead = subject's
+// left = rig "Right", see ARM_LM).
+function leadRigSide(poses, clubs) {
+  let votes = 0;
+  poses.forEach((frame, i) => {
+    const c = clubs[i];
+    if (!frame || !c || !c.has_club || !c.grip || !c.shaft_end) return;
+    const lms = frame.landmarks || [];
+    const l = getLM(lms, 15), r = getLM(lms, 16);   // subject's left, right wrist
+    if (!l || !r) return;
+    const grip = new THREE.Vector3(c.grip.x, -c.grip.y, -c.grip.z);
+    const unit = new THREE.Vector3(c.shaft_end.x, -c.shaft_end.y, -c.shaft_end.z).sub(grip);
+    if (unit.lengthSq() < 1e-8) return;
+    unit.normalize();
+    votes += Math.sign(r.sub(l).dot(unit));   // + when the left wrist is nearer the butt
+  });
+  return votes >= 0 ? 'Right' : 'Left';
+}
+
+// How far into the finish each frame is, as two weights 0 → 1 (see
+// finishClubFix): `up` from when, after impact, the hands first climb above
+// the nose, and `back` from when they are first also over on the back of the
+// head's side of it (`back`, see clipFinishBackSide) — the club past 12
+// o'clock. Each ramps to 1 over FINISH_RAMP frames and stays there to the end
+// of the clip. Decided once per clip so scrubbing backwards and forwards gives
+// the same pose.
+const FINISH_RAMP = 10;
+function clipFinishWeights(poses, phases, back) {
+  const up = new Array(poses.length).fill(0);
+  const behind = new Array(poses.length).fill(0);
+  const impact = phases && (phases['Impact'] || phases['Follow Through']);
+  if (!impact) return { up, back: behind };
+  let upStart = -1, backStart = -1;
+  for (let i = impact.start; i < poses.length && backStart < 0; i++) {
+    const lms = (poses[i] && poses[i].landmarks) || [];
+    const nose = getLM(lms, 0);
+    const hands = avgPts(getLM(lms, 15), getLM(lms, 16));
+    if (!nose || !hands || hands.y <= nose.y) continue;
+    if (upStart < 0) upStart = i;
+    if (back * (hands.x - nose.x) > 0) backStart = i;
+  }
+  const ramp = (w, start) => {
+    if (start < 0) return;
+    for (let i = start; i < poses.length; i++) w[i] = Math.min(1, (i - start + 1) / FINISH_RAMP);
+  };
+  ramp(up, upStart);
+  ramp(behind, backStart);
+  return { up, back: behind };
+}
+
+// Which way the back of the head is on screen in the finish, ±1 along x: the
+// side the hands are on at the top of the backswing. Seen face-on, the hands
+// finish up behind the head on the same side they went back to, the trail
+// side. Taken from the top rather than from the finish itself, where the
+// landmarks can be mirrored with the golfer's back to the camera.
+function clipFinishBackSide(poses, phases) {
+  const top = phases && phases['Top'];
+  let sum = 0;
+  if (top) {
+    for (let i = top.start; i <= Math.min(top.end, poses.length - 1); i++) {
+      const lms = (poses[i] && poses[i].landmarks) || [];
+      const nose = getLM(lms, 0);
+      const hands = avgPts(getLM(lms, 15), getLM(lms, 16));
+      if (nose && hands) sum += hands.x - nose.x;
+    }
+  }
+  return sum > 0 ? 1 : -1;
+}
+
+// How far out from the wrist joint the club actually crosses the hand — the
+// same wrist→tunnel distance cached in tunnelOffset, averaged over both hands.
+function palmReach() {
+  const lens = ['Left', 'Right']
+    .map(s => tunnelOffset[B(s + 'Hand')])
+    .filter(Boolean)
+    .map(o => o.length());
+  return lens.length ? lens.reduce((a, b) => a + b, 0) / lens.length : 0;
+}
+
+// The club estimator reports the grip as the midpoint of the two WRIST
+// landmarks, but nobody holds a club at the wrist — it crosses the palms a
+// palm-length further out, along the knuckles. Rendering the shaft through the
+// wrist joints meant the hands had to be dragged backwards onto it, which
+// compressed the forearm (down to 0.47x on this video) and stretched the palm
+// to twice its length to make up the difference. Shifting the whole club out
+// to where the hands really close around it keeps every arm bone at its
+// natural length instead. Rendering only — the metrics in club_estimation.py
+// are computed from the unshifted data, and a near-constant offset would not
+// change the velocities they derive anyway.
+function palmShift(knuckleDir) {
+  const avg = new THREE.Vector3();
+  let n = 0;
+  ['Left', 'Right'].forEach(s => {
+    const d = knuckleDir[s];
+    if (d && d.lengthSq() > 1e-8) { avg.add(d.clone().normalize()); n++; }
+  });
+  if (!n || avg.lengthSq() < 1e-8) return new THREE.Vector3();
+  return avg.normalize().multiplyScalar(palmReach());
+}
+
+// In the finish the hands sit up behind the head with the shaft across the
+// back of the neck — from a face-on camera, the grip level with the forehead
+// beside the head and the shaft crossing in front of the neck toward the club
+// head (TigerWoodsDriver.mov ~600 on). Past side-on the golfer's back is to
+// the camera and the landmarks' depth is a guess: there the club data put the
+// grip ~30 cm BEHIND the rig's head at chin height, so the head and shoulders
+// hid the hands and most of the shaft. So, blended in by `w.up` (and the
+// slide toward the back of the head by `w.back`, see clipFinishWeights):
+//   1. the club is moved so the fists are, on screen, where the video has
+//      the hands relative to the head (`gripFromHead`, in torso lengths
+//      from the ears, see _grip_from_head in club_estimation.py) — on
+//      steelpwedge1.mov at the back of the head at ear height, where a fixed
+//      "over the crown" pushed them up and the right arm with them. Upward
+//      only: where the club data has the hands higher, they stay there. And
+//      until the video has the hands over on the back of the head (fading
+//      out as they get FINISH_BEHIND torso lengths behind the ears), they go
+//      at least FINISH_GRIP_ABOVE skull radii over the crown: as the hands
+//      swing up past the head MediaPipe's 2D hands drag at it — at the ear
+//      on steelpwedge1.mov 285–297, at the cap on TigerWoodsDriver.mov
+//      600–640, where the video has them well over it — and the forearms
+//      came down across the face. Without
+//      that measurement, the grip is lifted to FINISH_GRIP_ABOVE skull radii
+//      above the top of the head and slid toward the back of the head
+//      (`back`, see clipFinishBackSide) to FINISH_GRIP_BACK skull radii
+//      behind its centre. Then, as far as the fists overlap the head on
+//      screen (within FINISH_FIST_R of its outline), the grip comes toward
+//      the camera (+z) until it is clear in front of the skull. Only that
+//      far: brought out in front of the face to keep the SHAFT in front, it
+//      dragged the trail arm across the face (steelpwedge1.mov ~320 on),
+//      where the video's runs behind the head; step 2 tilts the shaft
+//      instead. Fists up over the crown stay where they are, too: brought
+//      out in front of it and back as they passed over the head
+//      (steelpwedge1.mov 280–300), they swung the trail arm with them;
+//   2. the shaft is swung about the grip, keeping its length, just enough
+//      that wherever it crosses the head, neck, shoulders or chest on screen
+//      it passes in front of them. Past them it may still run back behind
+//      the body, as the club head does. It is also tilted toward the camera
+//      until it is no longer on screen than the video shows it (`screenFrac`
+//      of its length, see _screen_fractions in club_estimation.py): the club
+//      data always lays the shaft out at full length on screen, so where the
+//      video's club hangs behind the golfer at half its length (~650–690 on
+//      TigerWoodsDriver.mov) the rig's swept down to the ground. With the
+//      golfer's back to the camera, behind the golfer is toward it.
+// Returns that correction, {move, tilt}: the grip's shift and how much the
+// shaft's depth component (as a fraction of its length) is raised. Measured
+// for every frame up front and smoothed over time (see clipFinishFix) before
+// it is applied (see applyClubFix). Rendering only, like palmShift.
+const FINISH_EAR_HEIGHT = 0.75;   // of the way from the skull base to the top
+const FINISH_GRIP_ABOVE = 0.5;
+const FINISH_BEHIND = 0.4;
+const FINISH_GRIP_BACK = 0.8;
+const FINISH_FIST_R = 0.06;       // metres
+const FINISH_CLEARANCE = 0.03;    // metres in front of each body part
+function finishClubFix(bones, grip, end, w, back, screenFrac, gripFromHead) {
+  if (!(w.up > 0)) return null;
+  const pos = n => bones[B(n)] ? bones[B(n)].getWorldPosition(new THREE.Vector3()) : null;
+  const head = pos('Head'), top = pos('HeadTop_End');
+  if (!head || !top) return null;
+  const skull = head.clone().lerp(top, 0.5);
+  const skullR = 0.65 * head.distanceTo(top);
+  // Body parts the shaft must pass in front of, as (centre, radius).
+  const parts = [[skull, skullR]];
+  [['Neck', 0.07], ['LeftArm', 0.07], ['RightArm', 0.07], ['Spine2', 0.15], ['Spine1', 0.15]]
+    .forEach(([n, r]) => { const p = pos(n); if (p) parts.push([p, r]); });
+
+  // 1. Grip where the video has the hands by the head, and out in front of
+  // the skull as far as the fists overlap it.
+  const move = new THREE.Vector3();
+  const shoulders = bodyShoulderCentre(bones), hips = bodyHipCentre(bones);
+  const torso = (shoulders && hips) ? Math.hypot(shoulders.x - hips.x, shoulders.y - hips.y) : 0;
+  if (gripFromHead && torso > 1e-3) {
+    const ear = head.clone().lerp(top, FINISH_EAR_HEIGHT);
+    move.x = (ear.x + gripFromHead.x * torso - grip.x) * w.up;
+    const seen = ear.y - gripFromHead.y * torso;   // image y is down
+    const overCrown = top.y + FINISH_GRIP_ABOVE * skullR;
+    const behind = Math.min(1, Math.max(0, back * gripFromHead.x / FINISH_BEHIND));
+    const targetY = seen + (1 - behind) * Math.max(0, overCrown - seen);
+    move.y = Math.max(0, targetY - grip.y) * w.up;
+  } else {
+    const backBy = FINISH_GRIP_BACK * skullR - back * (grip.x - skull.x);
+    move.x = back * Math.max(0, backBy) * w.back;
+    move.y = Math.max(0, top.y + FINISH_GRIP_ABOVE * skullR - grip.y) * w.up;
+  }
+  const minZ = skull.z + skullR + FINISH_CLEARANCE;
+  const onHead = Math.hypot(grip.x + move.x - skull.x, grip.y + move.y - skull.y);
+  const overlap = Math.min(1, Math.max(0, (skullR + FINISH_FIST_R - onHead) / FINISH_FIST_R));
+  const crownGap = FINISH_GRIP_ABOVE * skullR;
+  const belowCrown = Math.min(1, Math.max(0, (top.y + crownGap - (grip.y + move.y)) / crownGap));
+  move.z = Math.max(0, minZ - grip.z) * w.up * overlap * belowCrown;
+  const shaft = end.clone().sub(grip);
+  const len = shaft.length();
+  if (len < 1e-6) return null;
+  grip = grip.clone().add(move);
+
+  // 2. Lowest depth slope that keeps each part's crossing behind the shaft. A
+  // steeper slope changes the on-screen length and so where the crossings are,
+  // hence the few passes.
+  const d = shaft.clone();
+  const foreshorten = (screenFrac > 0 && screenFrac < 1)
+    ? Math.sqrt(1 - screenFrac * screenFrac) * len : -Infinity;
+  for (let pass = 0; pass < 3; pass++) {
+    const xy2 = d.x * d.x + d.y * d.y;
+    if (xy2 < 1e-8) break;
+    let dzMin = foreshorten;
+    parts.forEach(([c, r]) => {
+      const t = Math.min(1, Math.max(0, ((c.x - grip.x) * d.x + (c.y - grip.y) * d.y) / xy2));
+      if (t < 1e-3) return;
+      const dist = Math.hypot(grip.x + t * d.x - c.x, grip.y + t * d.y - c.y);
+      if (dist >= r) return;
+      const front = c.z + Math.sqrt(r * r - dist * dist) + FINISH_CLEARANCE;
+      dzMin = Math.max(dzMin, (front - grip.z) / t);
+    });
+    if (d.z >= dzMin) break;
+    d.z = Math.min(dzMin, 0.95 * len);
+    const xyScale = Math.sqrt(Math.max(len * len - d.z * d.z, 0) / xy2);
+    d.x *= xyScale; d.y *= xyScale;
+  }
+  const tilt = (shaft.clone().lerp(d, w.up).setLength(len).z - shaft.z) / len;
+  return { move, tilt, up: w.up };
+}
+
+// Apply a finishClubFix correction: shift the grip, then raise the shaft's
+// depth component by `tilt` of its length, keeping its length and its
+// direction on screen. Modifies grip and end in place.
+function applyClubFix(grip, end, fix) {
+  const shaft = end.clone().sub(grip);
+  const len = shaft.length();
+  const xy = Math.hypot(shaft.x, shaft.y);
+  if (len < 1e-6 || xy < 1e-6) return;
+  grip.add(fix.move);
+  const z = THREE.MathUtils.clamp(shaft.z / len + fix.tilt, -1, 1) * len;
+  const k = Math.sqrt(len * len - z * z) / xy;
+  end.set(grip.x + shaft.x * k, grip.y + shaft.y * k, grip.z + z);
+}
+
+// Gaussian-smooth a series of numbers over frames, `sigma` frames wide; the
+// window is cut at the clip's ends (and renormalised) rather than padded.
+function gaussSmooth(values, sigma) {
+  const n = values.length;
+  const r = Math.ceil(3 * sigma);
+  const kernel = [];
+  for (let k = -r; k <= r; k++) kernel.push(Math.exp(-0.5 * (k / sigma) ** 2));
+  return values.map((_, i) => {
+    let sum = 0, wsum = 0;
+    for (let k = -r; k <= r; k++) {
+      const j = i + k;
+      if (j < 0 || j >= n) continue;
+      sum += kernel[k + r] * values[j];
+      wsum += kernel[k + r];
+    }
+    return sum / wsum;
+  });
+}
+
+// finishClubFix for every frame of a clip, smoothed over time. Measured frame
+// by frame, the correction snaps: as the shaft swings across the head on
+// screen (~10° a frame through the finish on steelpwedge1.mov, 310–320),
+// whether it crosses the head and how far the grip must come forward to clear
+// it change within a frame or two, and the club jumped up to 30 cm between
+// frames. So each part of the correction is Gaussian-smoothed, and the parts
+// that keep the club clear of the body (the grip's move toward the camera and
+// the shaft's tilt) are first spread to the frames either side (a running max
+// over ±FINISH_FIX_HOLD frames, so a frame that needs one is never left with
+// less of it). Poses the rig through the whole clip, so it runs once at load,
+// before the first frame.
+const FINISH_FIX_HOLD = 3;
+const FINISH_FIX_SIGMA = 3;
+function clipFinishFix(sceneObj, poses, clubs) {
+  const n = poses.length;
+  const raw = poses.map((frame, i) => {
+    const w = { up: sceneObj.finishWeight.up[i], back: sceneObj.finishWeight.back[i] };
+    if (!(w.up > 0) || !frame) return null;
+    const measure = { w };
+    updateSkeleton(sceneObj, frame, clubs[i], measure, i);
+    return measure.fix || null;
+  });
+  resetTrail(sceneObj);
+  if (!raw.some(Boolean)) return raw;
+  // [value, held?] per part; the held ones only ever grow from 0, so the
+  // running max keeps the strongest correction.
+  const parts = [[f => f.move.x, false], [f => f.move.y, false], [f => f.move.z, true],
+                 [f => Math.max(0, f.tilt), true], [f => f.up, false]];
+  const held = parts.map(([get, hold]) => {
+    const v = raw.map(f => (f ? get(f) : 0));
+    if (!hold) return v;
+    return v.map((_, i) => {
+      let m = 0;
+      for (let j = Math.max(0, i - FINISH_FIX_HOLD); j <= Math.min(n - 1, i + FINISH_FIX_HOLD); j++) m = Math.max(m, v[j]);
+      return m;
+    });
+  });
+  const smooth = held.map(v => gaussSmooth(v, FINISH_FIX_SIGMA));
+  return smooth[0].map((_, i) => {
+    const [x, y, z, tilt, up] = smooth.map(v => v[i]);
+    if (!x && !y && !z && !tilt && !up) return null;
+    return { move: new THREE.Vector3(x, y, z), tilt, up };
+  });
+}
+
+// Midpoint of the rig's two shoulder joints (the upper-arm bones' heads), in
+// world space.
+function bodyShoulderCentre(bones) {
+  const l = bones[B('LeftArm')], r = bones[B('RightArm')];
+  if (!l || !r) return null;
+  return l.getWorldPosition(new THREE.Vector3())
+    .add(r.getWorldPosition(new THREE.Vector3())).multiplyScalar(0.5);
+}
+
+// Put the rig's shoulder joints where the video's are. Aiming each spine bone
+// along the landmark hip→shoulder line, and each clavicle at its landmark
+// shoulder, gets the DIRECTIONS right but not the joints: Xbot's spine curves
+// and its clavicles hang off the chest forward of the spine line, so through
+// the backswing on TigerWoodsDriver.mov its shoulders stayed upright over the
+// pelvis and ~4 cm too wide on screen, while the golfer's upper body leans away
+// from the target with the lead shoulder working down under the chin. So:
+//   1. the whole chest is swung about the base of the spine until the rig's
+//      shoulder centre sits where the landmarks put it relative to the hips
+//      (scaled by torso length), and
+//   2. each clavicle is re-aimed so its shoulder joint lands on the landmark
+//      shoulder, relative to that centre — scaled by the same torso ratio, so
+//      the shoulders take the golfer's width too (Xbot's are ~18% broader
+//      for its torso, which alone kept the lead shoulder several cm wide on
+//      screen). The clavicle is lengthened or shortened to land exactly
+//      (CLAVICLE_LIMITS), and the upper arm cancels that so the arm keeps the
+//      length fitted by applyArmScale.
+// `fit` holds the per-clip rig/landmark torso length ratio (see clipTorsoFit).
+const CLAVICLE_LIMITS = [0.7, 1.3];
+function placeShoulders(bones, fit, hipLM, shCtrLM, shoulderLM, armScale = 1) {
+  const spine = bones[B('Spine')];
+  const hipJoints = bodyHipCentre(bones);
+  if (!fit || !spine || !hipJoints || !hipLM || !shCtrLM) return;
+  const wp = b => b.getWorldPosition(new THREE.Vector3());
+
+  const want = hipJoints.add(shCtrLM.clone().sub(hipLM).multiplyScalar(fit.len));
+  const have = bodyShoulderCentre(bones);
+  const base = wp(spine);
+  if (have) {
+    const a = have.sub(base), b = want.clone().sub(base);
+    if (a.lengthSq() > 1e-8 && b.lengthSq() > 1e-8) {
+      const R = new THREE.Quaternion().setFromUnitVectors(a.normalize(), b.normalize());
+      setBoneWorldQ(spine, R.multiply(spine.getWorldQuaternion(new THREE.Quaternion())));
+      spine.updateMatrix();
+      spine.updateMatrixWorld(true);
+    }
+  }
+
+  ['Left', 'Right'].forEach(side => {
+    const clav = bones[B(side + 'Shoulder')];
+    const s = shoulderLM[side];
+    if (!clav || !s) return;
+    const joint = want.clone().add(s.clone().sub(shCtrLM).multiplyScalar(fit.len));
+    const reach = joint.sub(wp(clav));
+    driveBone(bones, B(side + 'Shoulder'), reach);
+    const rest = restClavicleLen[side];
+    const arm = bones[B(side + 'Arm')];
+    if (!rest || !arm) return;
+    const c = THREE.MathUtils.clamp(reach.length() / rest, CLAVICLE_LIMITS[0], CLAVICLE_LIMITS[1]);
+    clav.scale.setScalar(c);
+    clav.updateMatrix();
+    clav.updateMatrixWorld(true);
+    arm.scale.setScalar(armScale / c);
+    arm.updateMatrix();
+    arm.updateMatrixWorld(true);
+  });
+}
+
+// Per clip: rig ÷ landmark torso length (hip centre → shoulder centre),
+// landmark side taken as the median over the clip.
+function clipTorsoFit(model, poses) {
+  const bones = buildBoneMap(model);
+  const rest = restTorso;
+  if (!rest) return null;
+  const len = [];
+  poses.forEach(frame => {
+    const lms = (frame && frame.landmarks) || [];
+    const l = getLM(lms, 11), r = getLM(lms, 12), lh = getLM(lms, 23), rh = getLM(lms, 24);
+    if (!l || !r || !lh || !rh) return;
+    len.push(avgPts(l, r).distanceTo(avgPts(lh, rh)));
+  });
+  if (len.length < 10) return null;
+  len.sort((x, y) => x - y);
+  return { len: rest.len / len[Math.floor(len.length / 2)] };
+}
+
+// Midpoint of the rig's hip JOINTS (the thigh bones' heads) — where MediaPipe's
+// hip landmarks are, unlike the Hips bone, which sits several cm above them.
+function bodyHipCentre(bones) {
+  const l = bones[B('LeftUpLeg')], r = bones[B('RightUpLeg')];
+  if (!l || !r) return null;
+  return l.getWorldPosition(new THREE.Vector3())
+    .add(r.getWorldPosition(new THREE.Vector3())).multiplyScalar(0.5);
+}
+
+// The rig at rest: torso length (hip joints → shoulder joints, centre to
+// centre) and each clavicle's length (its head → the shoulder joint).
+let restTorso = null;
+const restClavicleLen = {};
+function cacheTorso(model) {
+  const bones = buildBoneMap(model);
+  model.updateMatrixWorld(true);
+  const wp = b => b.getWorldPosition(new THREE.Vector3());
+  const hips = bodyHipCentre(bones);
+  const c = bodyShoulderCentre(bones);
+  if (!hips || !c) return;
+  restTorso = { len: c.distanceTo(hips) };
+  ['Left', 'Right'].forEach(side => {
+    const clav = bones[B(side + 'Shoulder')], arm = bones[B(side + 'Arm')];
+    if (clav && arm) restClavicleLen[side] = wp(clav).distanceTo(wp(arm));
+  });
+}
+
+// The subject's landmarks for each of the rig's arms. As with the legs (see
+// updateSkeleton), after the 180° Y turn the rig's anatomical "Left" bones sit
+// on the subject's RIGHT, so they take the subject's right-arm landmarks. The
+// arms used to take the same-named side instead, which aimed each clavicle
+// across the chest to the far shoulder: the two crossed in the middle and
+// pulled the shoulder joints in to 0.12 apart, narrower than the 0.16 hips.
+const ARM_LM = {
+  Left:  { shoulder: 12, elbow: 14, wrist: 16, pinky: 18, index: 20 },
+  Right: { shoulder: 11, elbow: 13, wrist: 15, pinky: 17, index: 19 },
+};
+
+// Which way the knuckles point, read off the video: MediaPipe tracks a pinky,
+// index and thumb per hand, so the hand's roll around the shaft is measured
+// rather than invented. Falls back to the forearm direction (the hand roughly
+// continues the forearm) when those landmarks were dropped.
+function measuredKnuckleDir(lm, side, elbowLM, wristLM) {
+  const w = lm(ARM_LM[side].wrist);
+  const pinky = lm(ARM_LM[side].pinky);
+  const index = lm(ARM_LM[side].index);
+  const knuckles = avgPts(pinky, index);
+  if (w && knuckles) {
+    const d = knuckles.clone().sub(w);
+    if (d.lengthSq() > 1e-8) return d;
+  }
+  if (elbowLM && wristLM) return wristLM.clone().sub(elbowLM);
+  return null;
+}
+
+// Stretch the forearm along its local length axis (X — see the Hand child's
+// rest position, which sits almost entirely on X) so the hand bone's fixed
+// REST-POSE offset lands exactly on worldTarget once the forearm has been
+// rotated toward it. This replaces forcibly overriding the hand bone's own
+// local position: moving a leaf bone's position independently of its parent
+// chain's actual reach tears the skinned mesh at the wrist, because vertices
+// with weight split between the ForeArm and Hand bones get dragged apart by
+// two transforms that no longer agree on where the joint is. Scaling the
+// parent instead keeps every skin-weighted vertex smoothly consistent — the
+// same mechanism standard "stretchy bone" IK rigs use. The hand bone gets
+// the inverse scale so its own geometry (and the fingers hanging off it)
+// doesn't balloon or shrink along with the forearm.
+const FOREARM_STRETCH_LIMITS = [0.75, 1.35];
+function stretchForearmToTarget(bones, side, worldTarget, armScale = 1) {
+  const foreArm = bones[B(side + 'ForeArm')];
+  const hand = bones[B(side + 'Hand')];
+  const restLen = restForearmLenWorld[B(side + 'ForeArm')];
+  if (!foreArm || !hand || !worldTarget || !restLen || restLen < 1e-6) return;
+
+  // The forearm already inherits the whole arm's scale (see applyArmScale),
+  // so its own stretch is measured against that scaled length.
+  const elbowWorld = new THREE.Vector3();
+  foreArm.getWorldPosition(elbowWorld);
+  const k = THREE.MathUtils.clamp(
+    worldTarget.distanceTo(elbowWorld) / (restLen * armScale),
+    FOREARM_STRETCH_LIMITS[0], FOREARM_STRETCH_LIMITS[1]);
+
+  // Scale UNIFORMLY, not just along the length axis. The hand hangs off the
+  // forearm and cancels this scale with its own 1/k so it keeps its true size
+  // — but that cancellation only holds if the two agree on which direction is
+  // being scaled. Once the hand is rotated to wrap the shaft its local axes no
+  // longer line up with the forearm's, and a (k,1,1) stretch leaks through as
+  // a palm inflated by 1/k (30% oversized hands on this video). A uniform
+  // scale commutes with that rotation, so the hand comes out exactly right at
+  // any grip angle; the cost is the forearm changing thickness slightly along
+  // with its length.
+  foreArm.scale.setScalar(k);
+  foreArm.updateMatrix();
+  foreArm.updateMatrixWorld(true);
+
+  hand.scale.setScalar(1 / (k * armScale));
+  hand.updateMatrix();
+  hand.updateMatrixWorld(true);
+}
+
+// Reset a forearm/hand pair back to unstretched (used whenever no club is
+// gripped this frame, so a stretch applied on a previous club-gripping
+// frame doesn't linger).
+function resetForearmStretch(bones, side, armScale = 1) {
+  const foreArm = bones[B(side + 'ForeArm')];
+  const hand = bones[B(side + 'Hand')];
+  if (foreArm) { foreArm.scale.set(1, 1, 1); foreArm.updateMatrix(); foreArm.updateMatrixWorld(true); }
+  if (hand)    { hand.scale.setScalar(1 / armScale); hand.updateMatrix(); hand.updateMatrixWorld(true); }
+}
+
+// Fit the rig's arms to the golfer's. Xbot's arms are long for its body —
+// shoulder→wrist 0.56 against a 0.45 hip→neck — while MediaPipe's world
+// landmarks put a golfer's at roughly torso length (0.465 vs 0.50 on
+// TigerWoodsDriver.mov). The club is placed from those landmarks, so on the
+// rig's longer arms the grip sat too close to the shoulders: the hands fell
+// short of the club, the trail hand hung several cm down the shaft, and
+// reaching it would mean bending arms the video shows straight. Each upper
+// arm is scaled uniformly (the forearm and hand inherit it; the hand cancels
+// it, see stretchForearmToTarget) to the clip's own arm-to-rig ratio, only
+// ever shortened, by at most ARM_SCALE_MIN. `bodyScale` (the rig ÷ golfer
+// torso ratio, see clipTorsoFit) sizes the golfer's arm to the rig's body
+// first, so arm and torso keep the golfer's proportions.
+const ARM_SCALE_MIN = 0.7;
+function clipArmScale(poses, bodyScale = 1) {
+  const rig = ['Left', 'Right']
+    .map(s => (restUpperLenWorld[B(s + 'Arm')] || 0) + (restForearmLenWorld[B(s + 'ForeArm')] || 0));
+  const rigLen = (rig[0] + rig[1]) / 2;
+  if (!rigLen) return 1;
+  const lens = [];
+  poses.forEach(frame => {
+    const lms = (frame && frame.landmarks) || [];
+    [[11, 13, 15], [12, 14, 16]].forEach(([s, e, w]) => {
+      const a = getLM(lms, s), b = getLM(lms, e), c = getLM(lms, w);
+      if (a && b && c) lens.push(a.distanceTo(b) + b.distanceTo(c));
+    });
+  });
+  if (lens.length < 10) return 1;
+  lens.sort((x, y) => x - y);
+  return THREE.MathUtils.clamp(lens[Math.floor(lens.length / 2)] * bodyScale / rigLen, ARM_SCALE_MIN, 1);
+}
+
+function applyArmScale(bones, armScale) {
+  ['Left', 'Right'].forEach(side => {
+    // Clavicle back to rest length too, until placeShoulders refits it, so a
+    // frame never depends on the one shown before it.
+    const clav = bones[B(side + 'Shoulder')];
+    if (clav) { clav.scale.setScalar(1); clav.updateMatrix(); clav.updateMatrixWorld(true); }
+    const arm = bones[B(side + 'Arm')];
+    if (!arm) return;
+    arm.scale.setScalar(armScale);
+    arm.updateMatrix();
+    arm.updateMatrixWorld(true);
+  });
+}
+
+// Rotate the forearm toward worldTarget, measuring direction from the
+// forearm bone's own CURRENT world position rather than the upstream elbow
+// landmark. driveBone's other callers all use landmark-to-landmark
+// directions, which is fine for pure rotation — but stretchForearmToTarget
+// measures its distance from the bone's actual position, and a target close
+// to the arm's natural reach makes the rotation very sensitive to which
+// "from" point is used. Using the same reference point for both keeps them
+// in agreement so the stretched hand actually lands on worldTarget instead
+// of at an angle from it.
+function driveForeArmToGrip(bones, side, worldTarget) {
+  const foreArmName = B(side + 'ForeArm');
+  const foreArm = bones[foreArmName];
+  if (!foreArm || !worldTarget) return;
+  const elbowWorld = new THREE.Vector3();
+  foreArm.getWorldPosition(elbowWorld);
+  driveBone(bones, foreArmName, worldTarget.clone().sub(elbowWorld));
+}
+
+// Aim the upper arm so the elbow bends the way the VIDEO's arm bends, given
+// that the wrist is going to the grip target rather than to its own landmark.
+// Aiming the upper arm at the elbow landmark (lm12→lm14) and then pointing the
+// forearm from wherever that left the rig's elbow to a grip target a few cm
+// away from the wrist landmark kinked the arm — a lead arm dead straight in
+// the video came out bent at the elbow, because the rig's upper arm is a
+// different length than the subject's and the target isn't the landmark.
+// Instead, the landmark shoulder→elbow direction is carried over relative to
+// the shoulder→wrist line: rotate it by whatever turns the landmark
+// shoulder→wrist line onto the rig shoulder→target line. A straight arm in
+// the video then puts the elbow exactly on the rig's shoulder→target line, so
+// shoulder, elbow and wrist stay collinear, and a bent one keeps its bend.
+//
+// The rig's arm is a fixed length, though, and the forearm can only shorten to
+// FOREARM_STRETCH_LIMITS[0] of itself. When the grip is closer to the shoulder
+// than that allows (the trail arm through the takeaway on
+// TigerWoodsDriver.mov), keeping the video's elbow shape would leave the hand
+// short of the grip — it hung 2–5 cm down the shaft off the lead hand. A real
+// arm bends there, so the upper arm swings out of the reach line, in the plane
+// the video's elbow bends in, just far enough for the hand to land.
+//
+// `elbowToward` ({dir, k}, k 0–1) then swings the elbow round the
+// shoulder→grip line, keeping how far it bends, toward `dir`. The trail arm
+// takes it through the finish (see updateSkeleton), toward where the chest
+// faces: there the trail elbow points at the target in front of the chest
+// and the forearm rises past the face to the hands at the back of the head,
+// so a face-on camera, with the golfer's back to it, sees the arm behind the
+// head (steelpwedge1.mov ~300 on) — but the landmarks' depth, mirrored with
+// the golfer's back to the camera, bent it out across the face.
+const ELBOW_BEND_REACH = 0.8;   // × forearm rest length, just above the stretch floor
+function aimUpperArmAtGrip(bones, side, shoulderLM, elbowLM, wristLM, worldTarget, armScale = 1,
+                           elbowToward = null) {
+  const arm = bones[B(side + 'Arm')];
+  if (!arm || !shoulderLM || !elbowLM || !wristLM || !worldTarget) return false;
+  const shoulderWorld = arm.getWorldPosition(new THREE.Vector3());
+  const lmReach  = wristLM.clone().sub(shoulderLM);
+  const rigReach = worldTarget.clone().sub(shoulderWorld);
+  if (lmReach.lengthSq() < 1e-8 || rigReach.lengthSq() < 1e-8) return false;
+  const R = new THREE.Quaternion().setFromUnitVectors(
+    lmReach.clone().normalize(), rigReach.clone().normalize());
+  const upperDir = elbowLM.clone().sub(shoulderLM).applyQuaternion(R).normalize();
+
+  const U = (restUpperLenWorld[B(side + 'Arm')] || 0) * armScale;
+  const F = (restForearmLenWorld[B(side + 'ForeArm')] || 0) * armScale;
+  const D = rigReach.length();
+  if (U && F) {
+    const Fd = ELBOW_BEND_REACH * F;
+    const elbow = shoulderWorld.clone().addScaledVector(upperDir, U);
+    if (elbow.distanceTo(worldTarget) < Fd && D > Math.abs(U - Fd)) {
+      // Triangle shoulder–elbow–target with sides U, Fd, D: the upper arm's
+      // angle off the reach line.
+      const cosA = THREE.MathUtils.clamp((U * U + D * D - Fd * Fd) / (2 * U * D), -1, 1);
+      const reachUnit = rigReach.clone().normalize();
+      // Bend plane: the video's elbow, else elbows-down.
+      let pole = upperDir.clone().projectOnPlane(reachUnit);
+      if (pole.lengthSq() < 1e-6) pole = new THREE.Vector3(0, -1, 0).projectOnPlane(reachUnit);
+      if (pole.lengthSq() > 1e-8) {
+        pole.normalize();
+        upperDir.copy(reachUnit).multiplyScalar(cosA)
+          .addScaledVector(pole, Math.sqrt(1 - cosA * cosA));
+      }
+    }
+  }
+  if (elbowToward && elbowToward.k > 0) {
+    const reachUnit = rigReach.clone().normalize();
+    const along = upperDir.dot(reachUnit);
+    const out = upperDir.clone().addScaledVector(reachUnit, -along);
+    const toward = elbowToward.dir.clone().projectOnPlane(reachUnit);
+    if (out.lengthSq() > 1e-8 && toward.lengthSq() > 1e-8) {
+      // Turned round the reach line by `k` of the angle, rather than blended
+      // straight across: from nearly opposite sides the blend passed close to
+      // the line itself and the elbow jumped there.
+      const bend = out.length();
+      out.normalize();
+      toward.normalize();
+      const angle = Math.atan2(out.clone().cross(toward).dot(reachUnit), out.dot(toward));
+      out.applyAxisAngle(reachUnit, angle * elbowToward.k);
+      upperDir.copy(reachUnit).multiplyScalar(along).addScaledVector(out, bend);
+    }
+  }
+  driveBone(bones, B(side + 'Arm'), upperDir);
+  return true;
+}
+
+// Orient a hand so it wraps around the club shaft, then stretch the forearm
+// (not the hand's own position) so the wrist lands on the tunnel-adjusted
+// grip point. Must run after driveForeArmToGrip (see updateSkeleton), so the
+// forearm's local X already points the right way before we scale it.
+function orientHandOnGrip(bones, side, gripVec, shaftDir, knuckleDir, armScale = 1) {
+  const handName = B(side + 'Hand');
+  const bone = bones[handName];
+  const desiredWorldQ = gripHandWorldQuat(side, shaftDir, knuckleDir);
+  if (!bone || !desiredWorldQ) return;
+
+  setBoneWorldQ(bone, desiredWorldQ);
+  bone.updateMatrix();
+  bone.updateMatrixWorld(true);
+
+  stretchForearmToTarget(bones, side, gripWristTarget(side, gripVec, shaftDir, knuckleDir), armScale);
+}
+
+// ── Feet on the ground ──
+// Each foot's sole, measured off the rig at rest (where it stands flat on the
+// floor): heel, ball and toe-tip contact points in the Foot bone's own space,
+// plus the heel→toe direction in world space.
+const footSole = {};   // side → { heel, ball, toe } (Foot-local), { dir } (world, rest)
+const HEEL_BEHIND_ANKLE = 0.04;   // m — the heel's back edge behind the ankle joint
+function cacheFootSoles(model) {
+  const bones = buildBoneMap(model);
+  model.updateMatrixWorld(true);
+  const floorY = new THREE.Box3().setFromObject(model).min.y;
+  const wp = b => b.getWorldPosition(new THREE.Vector3());
+  ['Left', 'Right'].forEach(side => {
+    const foot = bones[B(side + 'Foot')];
+    const ball = bones[B(side + 'ToeBase')];
+    const toe  = bones[B(side + 'Toe_End')] || ball;
+    if (!foot || !ball) return;
+    const onFloor = p => new THREE.Vector3(p.x, floorY, p.z);
+    const ankle = onFloor(wp(foot));
+    const tip   = onFloor(wp(toe));
+    const dir = tip.clone().sub(ankle);
+    if (dir.lengthSq() < 1e-10) return;
+    dir.normalize();
+    const heel = ankle.clone().addScaledVector(dir, -HEEL_BEHIND_ANKLE);
+    footSole[side] = {
+      heel: foot.worldToLocal(heel.clone()),
+      ball: foot.worldToLocal(onFloor(wp(ball))),
+      toe:  foot.worldToLocal(tip.clone()),
+      dir:  tip.sub(heel).normalize(),
+    };
+  });
+}
+
+// MediaPipe's "heel" landmark is the back of the heel, a few cm up from the
+// sole, so its heel→toe line points toes-down even on a flat-planted foot
+// (~13°, the heel ~5 cm above the toe, at address on TigerWoodsDriver.mov).
+// The flattest that line gets over the clip — FLAT_FOOT_PCT percentile of its
+// pitch — is taken as "flat" for that foot, and only pitch beyond it is shown.
+const FLAT_FOOT_PCT = 0.2;
+function footPitch(heel, toe) {   // radians toes-down
+  const d = toe.clone().sub(heel);
+  return Math.atan2(-d.y, Math.hypot(d.x, d.z));
+}
+// Rig side → the subject's (heel, toe) landmarks (see the leg chains).
+const FOOT_LM = { Left: [30, 32], Right: [29, 31] };
+function clipFlatFootPitch(poses) {
+  const out = {};
+  Object.entries(FOOT_LM).forEach(([side, [h, t]]) => {
+    const p = [];
+    poses.forEach(frame => {
+      const lms = (frame && frame.landmarks) || [];
+      const heel = getLM(lms, h), toe = getLM(lms, t);
+      if (heel && toe) p.push(footPitch(heel, toe));
+    });
+    p.sort((a, b) => a - b);
+    out[side] = p.length >= 10 ? p[Math.floor(p.length * FLAT_FOOT_PCT)] : 0;
+  });
+  return out;
+}
+
+// Lay the foot along the video's heel→toe line. It used to be aimed from the
+// ankle at the toe-tip landmark, but that line slopes down even with the foot
+// flat on the ground (the ankle sits well above the toes), and it slopes at a
+// different angle than the rig's own ankle→ball bone does — so every foot came
+// out tipped onto its toes, heel in the air (~7 cm toe-down on
+// TigerWoodsDriver.mov). Heel→toe is the sole itself: level while the foot is
+// planted, and tilting up exactly as much as the heel really comes off the
+// ground through the finish. Falls back to ankle→toe without a heel landmark.
+// `pose` ({yaw, pitch}, see clipFootPoses) replaces the landmarks' heading
+// and pitch-above-flat when given.
+function driveFootFlat(bones, side, heelLM, toeLM, ankleLM, flatPitch = 0, pose = null) {
+  const name = B(side + 'Foot');
+  const bone = bones[name];
+  const rWorldQ = restWorldQ[name];
+  const sole = footSole[side];
+  if (!bone || !rWorldQ || !sole || !heelLM || !toeLM) {
+    if (ankleLM && toeLM) driveBone(bones, name, toeLM.clone().sub(ankleLM));
+    return;
+  }
+  const fwd = pose ? new THREE.Vector3(Math.sin(pose.yaw), 0, Math.cos(pose.yaw))
+                   : toeLM.clone().sub(heelLM).setY(0);
+  if (fwd.lengthSq() < 1e-8) return;
+  fwd.normalize();
+  const pitch = pose ? pose.pitch : footPitch(heelLM, toeLM) - flatPitch;
+  const want = fwd.clone().multiplyScalar(Math.cos(pitch)).setY(-Math.sin(pitch));
+  // Turn to the heading about the vertical, then tip toe up/down about the
+  // horizontal: a single minimal rotation between the two would also roll the
+  // foot onto its edge whenever the heading changes, sinking the sole's side
+  // into the ground.
+  const R = new THREE.Quaternion().setFromUnitVectors(fwd, want)
+    .multiply(new THREE.Quaternion().setFromUnitVectors(sole.dir, fwd));
+  setBoneWorldQ(bone, rWorldQ.clone().premultiply(R));
+  bone.updateMatrix();
+  bone.updateMatrixWorld(true);
+}
+
+// Lowest point of a foot's sole, world Y.
+function soleLow(bones, side) {
+  const foot = bones[B(side + 'Foot')];
+  const sole = footSole[side];
+  if (!foot || !sole) return null;
+  return Math.min(...['heel', 'ball', 'toe'].map(k => foot.localToWorld(sole[k].clone()).y));
+}
+
+// Two-bone leg IK: move the ankle by `offset` (world), keeping both bone
+// lengths and the knee pointing the way it already does, or toward `pole`.
+function moveAnkle(bones, side, offset, pole = null) {
+  const up = bones[B(side + 'UpLeg')], leg = bones[B(side + 'Leg')], foot = bones[B(side + 'Foot')];
+  if (!up || !leg || !foot) return;
+  const wp = b => b.getWorldPosition(new THREE.Vector3());
+  const hip = wp(up), knee = wp(leg), ankle = wp(foot);
+  const U = hip.distanceTo(knee), L = knee.distanceTo(ankle);
+  const target = ankle.clone().add(offset);
+  const reach = target.clone().sub(hip);
+  // A straight leg is as far as it goes.
+  const d = THREE.MathUtils.clamp(reach.length(), Math.abs(U - L) + 1e-4, U + L - 1e-4);
+  const axis = reach.normalize();
+  const bendDir = (pole || knee.clone().sub(hip)).clone().projectOnPlane(axis);
+  if (bendDir.lengthSq() < 1e-10) bendDir.copy(new THREE.Vector3(0, 0, 1).projectOnPlane(axis));
+  bendDir.normalize();
+  const along = (d * d + U * U - L * L) / (2 * d);
+  const out = Math.sqrt(Math.max(U * U - along * along, 0));
+  const newKnee = hip.clone().addScaledVector(axis, along).addScaledVector(bendDir, out);
+  driveBone(bones, B(side + 'UpLeg'), newKnee.clone().sub(hip));
+  driveBone(bones, B(side + 'Leg'), hip.clone().addScaledVector(axis, d).sub(newKnee));
+}
+
+// Set the golfer down on the ground. The model is hung from the hip centre,
+// and the rig's legs are not the golfer's length, so where the feet ended up
+// was an accident of proportion: sunk into the grid at address, one foot
+// floating at the top and through the finish. Both feet stay on the ground
+// through a golf swing — a heel coming up in the finish rolls the foot onto
+// its toe, it doesn't leave the turf — so the body is set down until the
+// HIGHER foot's lowest point touches the ground, then the other foot is
+// brought up onto it by bending its knee (always possible, unlike
+// straightening a leg to reach further). How far a heel is up is carried by
+// the foot's pitch (driveFootFlat), not its height. With the clip's toe
+// anchors, the body has already been placed over them (see clipFootPlant),
+// and each leg just carries its toe tip onto its anchor instead, its knee
+// toward `kneePole[side]` when given. `refoot[side]()` re-lays that foot
+// after its leg moves.
+function plantFeet(sceneObj, refoot, kneePole = null) {
+  const bones = sceneObj.soldierBones;
+  const groundY = sceneObj.grid.position.y;
+  const sides = ['Left', 'Right'].filter(s => soleLow(bones, s) !== null);
+  if (!sides.length) return;
+  const anchors = sceneObj.footAnchor;
+  if (!anchors) {
+    sceneObj.soldierModel.position.y += groundY - Math.max(...sides.map(s => soleLow(bones, s)));
+    sceneObj.soldierModel.updateMatrixWorld(true);
+  }
+  sides.forEach(side => {
+    let offset;
+    if (anchors) {
+      const tip = toeTip(bones, side);
+      offset = new THREE.Vector3(anchors[side].x - tip.x, groundY - tip.y, anchors[side].z - tip.z);
+    } else {
+      offset = new THREE.Vector3(0, Math.max(0, groundY - soleLow(bones, side)), 0);   // up out of the ground
+    }
+    if (offset.lengthSq() < 1e-8) return;
+    moveAnkle(bones, side, offset, kneePole ? kneePole[side] : null);
+    refoot[side]();
+  });
+}
+
+// World position of a foot's toe tip (see cacheFootSoles).
+function toeTip(bones, side) {
+  const foot = bones[B(side + 'Foot')];
+  const sole = footSole[side];
+  return (foot && sole) ? foot.localToWorld(sole.toe.clone()) : null;
+}
+
+// How each foot is laid, per frame: {yaw, pitch} for driveFootFlat. MediaPipe
+// gives the feet relative to the hips, so as the hips turn the feet swing
+// round with them — on steelpwedge1.mov the trail foot's heading went from
+// −15° at address to −60° at the top and +16° in the finish, its toe
+// wandering 40 cm, while in the video both feet stay planted and only the
+// trail heel comes up, rolling the foot onto its toe, in the finish. So a
+// foot keeps the heading it has at address (median over the Address phase)
+// while it is flat, and follows the landmarks' only as its heel comes up
+// (FOOT_TURN_LIFT, degrees of pitch above flat) — a planted foot can't spin
+// on the ground. Heading and pitch are Gaussian-smoothed over FOOT_SIGMA
+// frames first, and a foot is never tipped toes-up past flat.
+const FOOT_SIGMA = 3;
+const FOOT_TURN_LIFT = [5, 15];
+function addressFrames(poses, phases) {
+  const a = phases && phases['Address'];
+  const lo = a ? a.start : 0;
+  const hi = a ? a.end : Math.max(0, Math.floor(poses.length * 0.1));
+  const out = [];
+  for (let i = lo; i <= Math.min(hi, poses.length - 1); i++) out.push(i);
+  return out;
+}
+function median(values) {
+  const v = values.slice().sort((a, b) => a - b);
+  return v.length ? v[Math.floor(v.length / 2)] : 0;
+}
+function clipFootPoses(poses, phases, flatPitch) {
+  const address = addressFrames(poses, phases);
+  const out = {};
+  Object.entries(FOOT_LM).forEach(([side, [h, t]]) => {
+    const yaw = [], pitch = [];
+    let lastYaw = null;
+    poses.forEach(frame => {
+      const lms = (frame && frame.landmarks) || [];
+      const heel = getLM(lms, h), toe = getLM(lms, t);
+      if (!heel || !toe) { yaw.push(null); pitch.push(null); return; }
+      let y = Math.atan2(toe.x - heel.x, toe.z - heel.z);
+      if (lastYaw !== null) y = lastYaw + Math.atan2(Math.sin(y - lastYaw), Math.cos(y - lastYaw));   // unwrapped
+      lastYaw = y;
+      yaw.push(y);
+      pitch.push(footPitch(heel, toe) - ((flatPitch && flatPitch[side]) || 0));
+    });
+    const fill = v => {   // gaps take the nearest frame's value
+      let last = v.find(x => x !== null);
+      return v.map(x => (x === null ? last : (last = x)));
+    };
+    if (!yaw.some(x => x !== null)) return;
+    const yawS = gaussSmooth(fill(yaw), FOOT_SIGMA);
+    const pitchS = gaussSmooth(fill(pitch), FOOT_SIGMA);
+    const yaw0 = median(address.map(i => yawS[i]));
+    const [lo, hi] = FOOT_TURN_LIFT.map(d => THREE.MathUtils.degToRad(d));
+    out[side] = yawS.map((y, i) => {
+      const k = THREE.MathUtils.clamp((pitchS[i] - lo) / (hi - lo), 0, 1);
+      return { yaw: yaw0 + (y - yaw0) * k, pitch: Math.max(0, pitchS[i]) };   // toes never up
+    });
+  });
+  return out;
+}
+
+// Pin the toes where they stand at address. MediaPipe's world landmarks are
+// centred on the hips, so the hips never move and the feet slide under them
+// instead: on steelpwedge1.mov the rig's toes travelled 25–35 cm across the
+// ground and up to 50 cm toward and away from the camera through the swing,
+// where the video's stay put. So, with the feet laid by clipFootPoses:
+//   1. each toe tip's anchor is where the landmark-driven legs put it at
+//      address (median over the Address phase), on the ground;
+//   2. per frame, the body is placed so that both legs reach their pinned
+//      feet bent just as the landmarks bend them: each knee's bend fixes how
+//      far that hip joint is from its ankle, so the body goes to the point,
+//      nearest where the landmarks put it, at which both hips are that far
+//      from their ankles (see placeOverFeet). Placed by splitting the
+//      difference between the toes instead, the trail leg in the finish had
+//      to stretch straight to its toe and the body dropped to let it,
+//      buckling the lead knee (steelpwedge1.mov: lead 30–43°, trail 2°,
+//      where the video and the landmarks have the lead leg posted at ~15°
+//      and the trail knee bent ~30°);
+//   3. that position is Gaussian-smoothed over FOOT_SHIFT_SIGMA frames —
+//      the knees bob with every wobble in the landmarks' knee bend otherwise
+//      — and its depth (toward and away from the camera) over
+//      FOOT_DEPTH_SIGMA, then held there while the rest is solved again:
+//      depth is what a face-on camera sees least, and taken frame by frame
+//      it swung the body 33 cm to and fro on steelpwedge1.mov, where the
+//      video's hips mostly slide side to side;
+//   4. each leg then takes up what's left as it is planted (see plantFeet),
+//      carrying its toe onto the anchor, its knee pointing out over its foot
+//      (the foot's heading, see clipFootPoses) with KNEE_FOLLOW of the way
+//      the landmarks' knee points, smoothed likewise. A knee flexes forward
+//      over the toes, which a face-on camera barely sees; the landmarks'
+//      knees, their depth guessed, bent sideways instead, the rig's bowing
+//      in through the downswing and the lead knee bulging out in the finish
+//      (steelpwedge1.mov 175–225, 270–330), where the video's legs look
+//      near straight.
+// Poses the rig through the whole clip, so it runs once at load.
+const FOOT_SHIFT_SIGMA = 4;
+const FOOT_DEPTH_SIGMA = 12;
+const KNEE_FOLLOW = 0.25;
+function clipFootPlant(sceneObj, poses, clubs, phases) {
+  sceneObj.footAnchor = null;
+  sceneObj.rootShift = null;
+  sceneObj.kneePole = null;
+  sceneObj.plantOff = true;
+  const bones = sceneObj.soldierBones;
+  const wp = n => bones[B(n)].getWorldPosition(new THREE.Vector3());
+  // The landmark-driven pose, feet not planted.
+  const measure = i => {
+    if (!poses[i]) return null;
+    updateSkeleton(sceneObj, poses[i], clubs[i], null, i);
+    const root = sceneObj.soldierModel.position.clone();
+    const legs = {};
+    for (const side of ['Left', 'Right']) {
+      const tip = toeTip(bones, side);
+      if (!tip) return null;
+      const hip = wp(side + 'UpLeg'), knee = wp(side + 'Leg'), ankle = wp(side + 'Foot');
+      const pole = knee.clone().sub(hip).projectOnPlane(ankle.clone().sub(hip).normalize());
+      legs[side] = { hip: hip.clone().sub(root), reach: hip.distanceTo(ankle), tip, toe: tip.clone().sub(ankle),
+                     pole: pole.lengthSq() > 1e-10 ? pole.normalize() : null };
+    }
+    return { root, legs };
+  };
+  const frames = poses.map((_, i) => measure(i));
+  sceneObj.plantOff = false;
+  resetTrail(sceneObj);
+  const address = addressFrames(poses, phases).map(i => frames[i]).filter(Boolean);
+  if (!address.length) return;
+  const groundY = sceneObj.grid.position.y;
+  const anchors = {};
+  ['Left', 'Right'].forEach(side => {
+    anchors[side] = new THREE.Vector3(median(address.map(f => f.legs[side].tip.x)), groundY,
+                                      median(address.map(f => f.legs[side].tip.z)));
+  });
+  const fill = (v, empty) => {
+    let last = v.find(Boolean) || empty;
+    return v.map(r => (r ? (last = r) : last));
+  };
+  const legsOf = f => ['Left', 'Right'].map(side => ({
+    hip: f.legs[side].hip, reach: f.legs[side].reach,
+    ankle: anchors[side].clone().sub(f.legs[side].toe),
+  }));
+  const solve = (depth = null) => fill(frames.map((f, i) => {
+    if (!f) return null;
+    // Start from the landmarks' place, set down so the toes are on average
+    // on their anchors.
+    const start = f.root.clone();
+    ['Left', 'Right'].forEach(side => start.addScaledVector(anchors[side].clone().sub(f.legs[side].tip), 0.5));
+    if (depth) start.z = f.root.z + depth[i];
+    return placeOverFeet(start, legsOf(f), !!depth).sub(f.root);
+  }), new THREE.Vector3());
+  const depth = gaussSmooth(solve().map(r => r.z), FOOT_DEPTH_SIGMA);
+  const held = solve(depth);
+  const [xs, ys] = ['x', 'y'].map(c => gaussSmooth(held.map(r => r[c]), FOOT_SHIFT_SIGMA));
+  sceneObj.rootShift = xs.map((x, i) => ({ x, y: ys[i], z: depth[i] }));
+  sceneObj.footAnchor = anchors;
+  // Knee directions: out over the foot, a little of the landmarks', smoothed.
+  const poles = {};
+  ['Left', 'Right'].forEach(side => {
+    const v = fill(frames.map((f, i) => {
+      const foot = sceneObj.footPose && sceneObj.footPose[side] && sceneObj.footPose[side][i];
+      const lm = f && f.legs[side].pole;
+      if (!foot) return lm || null;
+      const fwd = new THREE.Vector3(Math.sin(foot.yaw), 0, Math.cos(foot.yaw));
+      return lm ? fwd.lerp(lm, KNEE_FOLLOW) : fwd;
+    }), new THREE.Vector3(0, 0, 1));
+    const [px, py, pz] = ['x', 'y', 'z'].map(c => gaussSmooth(v.map(p => p[c]), FOOT_SHIFT_SIGMA));
+    poles[side] = px.map((x, i) => new THREE.Vector3(x, py[i], pz[i]));
+  });
+  sceneObj.kneePole = poses.map((_, i) => ({ Left: poles.Left[i], Right: poles.Right[i] }));
+}
+
+// The body position nearest `start` at which each leg's hip joint (`hip`,
+// relative to the body) is `reach` from its `ankle` target — alternately
+// pulling the body so each hip lands on its sphere, averaged over the legs.
+// With `holdDepth`, the body only moves across and up and down (x, y).
+function placeOverFeet(start, legs, holdDepth = false) {
+  const root = start.clone();
+  for (let it = 0; it < 40; it++) {
+    const step = new THREE.Vector3();
+    legs.forEach(l => {
+      const hip = root.clone().add(l.hip);
+      const out = hip.clone().sub(l.ankle);
+      const len = out.length();
+      if (len < 1e-6) return;
+      step.addScaledVector(out, (l.reach - len) / len / legs.length);
+    });
+    if (holdDepth) step.z = 0;
+    root.add(step);
+    if (step.lengthSq() < 1e-10) break;
+  }
+  return root;
+}
+
+// ── Load Soldier.glb ──
+const loader = new GLTFLoader();
+loader.load(
+  MODEL_URL,
+  (gltf) => {
+    const originalScene = gltf.scene;
+
+    // Rotate 180° around Y so the model's left/right axes align with
+    // MediaPipe world space (MediaPipe X+ = subject's right; Xbot X+ = model's left).
+    originalScene.rotation.y = Math.PI;
+
+    // Enable shadows on all meshes
+    originalScene.traverse(obj => {
+      if (obj.isMesh || obj.isSkinnedMesh) {
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+      }
+    });
+
+    // Auto-detect Mixamo bone naming prefix ('mixamorig:Hips' vs 'mixamorigHips' etc.)
+    originalScene.traverse(obj => {
+      if (!obj.isBone) return;
+      const hipsIdx = obj.name.indexOf('Hips');
+      if (hipsIdx >= 0) MIXAMO_PREFIX = obj.name.slice(0, hipsIdx);
+    });
+
+    // Cache rest pose data after rotation so axes already match MediaPipe space.
+    cacheRestData(originalScene);
+    cacheHandTunnelOffsets(originalScene);
+    cachePelvisAxis(originalScene);
+    cacheFootSoles(originalScene);
+    cacheTorso(originalScene);
+
+    // Hip rest Y offset (world Y of Hips bone in rest pose)
+    let hipRestY = 0;
+    originalScene.traverse(obj => {
+      if (obj.isBone && obj.name === B('Hips')) {
+        const p = new THREE.Vector3();
+        obj.getWorldPosition(p);
+        hipRestY = p.y;
+      }
+    });
+
+    // Set up main scene model
+    mainScene.soldierModel = originalScene;
+    mainScene.soldierBones = buildBoneMap(originalScene);
+    mainScene.hipRestY = hipRestY;
+    mainScene.torsoFit = clipTorsoFit(originalScene, poseData);
+    mainScene.armScale = clipArmScale(poseData, mainScene.torsoFit ? mainScene.torsoFit.len : 1);
+    mainScene.grid.position.y = -hipRestY; // align grid with model feet
+    mainScene.flatFootPitch = clipFlatFootPitch(poseData);
+    mainScene.footPose = clipFootPoses(poseData, phaseData, mainScene.flatFootPitch);
+    clipFootPlant(mainScene, poseData, clubData, phaseData);
+    mainScene.finishBack = clipFinishBackSide(poseData, phaseData);
+    mainScene.finishWeight = clipFinishWeights(poseData, phaseData, mainScene.finishBack);
+    mainScene.finishFix = clipFinishFix(mainScene, poseData, clubData);
+    mainScene.scene.add(originalScene);
+
+    // Set up comparison scene model (independent clone)
+    if (compScene) {
+      const clone = SkeletonUtils.clone(originalScene);
+      clone.traverse(obj => {
+        if (obj.isMesh || obj.isSkinnedMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+          // Clone material so phase color is independent
+          if (obj.material) obj.material = obj.material.clone();
+        }
+      });
+      compScene.soldierModel = clone;
+      compScene.soldierBones = buildBoneMap(clone);
+      compScene.hipRestY = hipRestY;
+      compScene.torsoFit = clipTorsoFit(clone, comparisonPose);
+      compScene.armScale = clipArmScale(comparisonPose, compScene.torsoFit ? compScene.torsoFit.len : 1);
+      compScene.grid.position.y = -hipRestY;
+      compScene.flatFootPitch = clipFlatFootPitch(comparisonPose);
+      const compPhases = Object.keys(comparisonPhaseData).length ? comparisonPhaseData : null;
+      compScene.footPose = clipFootPoses(comparisonPose, compPhases, compScene.flatFootPitch);
+      clipFootPlant(compScene, comparisonPose, comparisonClub, compPhases);
+      compScene.finishBack = clipFinishBackSide(comparisonPose, compPhases);
+      compScene.finishWeight = clipFinishWeights(comparisonPose, compPhases, compScene.finishBack);
+      compScene.finishFix = clipFinishFix(compScene, comparisonPose, comparisonClub);
+      compScene.scene.add(clone);
+    }
+
+    document.getElementById('loading').style.display = 'none';
+    animate(performance.now());
+  },
+  undefined,
+  (err) => {
+    console.error('Soldier.glb load error:', err);
+    document.getElementById('loading').textContent = 'Failed to load 3D model.';
+  }
+);
+
+// ── Landmark helpers ──
+function getLM(landmarks, idx) {
+  const l = landmarks.find(l => l.idx === idx);
+  return (l && l.x !== null) ? new THREE.Vector3(l.x, -l.y, -l.z) : null;
+}
+
+function avgPts(...pts) {
+  const valid = pts.filter(Boolean);
+  if (!valid.length) return null;
+  const s = new THREE.Vector3();
+  valid.forEach(p => s.add(p));
+  return s.divideScalar(valid.length);
+}
+
+function lerpPts(a, b, t) {
+  return (a && b) ? a.clone().lerp(b, t) : null;
+}
+
+// ── Update skeleton (Soldier model driven by landmarks) ──
+// `finish` is this frame's smoothed finish correction for the club (see
+// clipFinishFix), or { w } to measure it instead, leaving it in `finish.fix`.
+// `frameIdx` picks this frame's entries in the clip-wide foot and body
+// placement (see clipFootPlant), which sets `sceneObj.plantOff` while it
+// measures the unplanted pose.
+function updateSkeleton(sceneObj, frameData, clubFrame, finish = null, frameIdx = -1) {
+  if (!sceneObj.soldierModel) return;
+
+  const lms = frameData.landmarks || [];
+  const lm = i => getLM(lms, i);
+
+  const bones = sceneObj.soldierBones;
+  const armScale = sceneObj.armScale;
+  applyArmScale(bones, armScale);
+  const model = sceneObj.soldierModel;
+
+  // Key landmark positions (THREE.js Y-up space)
+  const lm0  = lm(0);
+  const lm7  = lm(7),  lm8  = lm(8);
+  const lm9  = lm(9),  lm10 = lm(10);
+  const lm11 = lm(11), lm12 = lm(12);
+  const lm13 = lm(13), lm14 = lm(14);
+  const lm15 = lm(15), lm16 = lm(16);
+  const lm23 = lm(23), lm24 = lm(24);
+  const lm25 = lm(25), lm26 = lm(26);
+  const lm27 = lm(27), lm28 = lm(28);
+  const lm29 = lm(29), lm30 = lm(30);
+  const lm31 = lm(31), lm32 = lm(32);
+
+  const hipCtr      = avgPts(lm23, lm24);
+  const shoulderCtr = avgPts(lm11, lm12);
+  const mouthCtr    = avgPts(lm9, lm10);
+  const earCtr      = avgPts(lm7, lm8);
+
+  // Position model root so hip bone aligns with MediaPipe hip center, moved
+  // over the ground by the clip's body shift (see clipFootPlant).
+  if (hipCtr) {
+    const shift = (sceneObj.rootShift && sceneObj.rootShift[frameIdx]) || { x: 0, y: 0, z: 0 };
+    model.position.set(hipCtr.x + shift.x, hipCtr.y - sceneObj.hipRestY + shift.y, hipCtr.z + shift.z);
+    model.updateMatrixWorld(true);
+  }
+
+  // Pelvis turn — before the spine and legs, which are its children and are
+  // then aimed in world space on top of it.
+  if (lm23 && lm24) drivePelvis(bones, lm24.clone().sub(lm23));
+
+  // Spine (interpolate along hip→shoulder axis)
+  const sp1 = lerpPts(hipCtr, shoulderCtr, 0.33);
+  const sp2 = lerpPts(hipCtr, shoulderCtr, 0.66);
+
+  const drive = (name, from, to) => {
+    if (from && to) driveBone(bones, name, to.clone().sub(from));
+  };
+
+  // Spine chain (parent → child order is critical). The twist is shared out
+  // along it — a third, two thirds, then all of the way from the hip line to
+  // the shoulder line — so the chest turns with the shoulders and the gap
+  // between hip and shoulder turn (the X-factor) shows as a wound-up torso.
+  const hipSide = (lm23 && lm24) ? lm24.clone().sub(lm23).normalize() : null;
+  const shSide  = (lm11 && lm12) ? lm12.clone().sub(lm11).normalize() : null;
+  const twistDrive = (name, from, to, t) => {
+    if (!from || !to) return;
+    if (hipSide && shSide) driveBoneTwisted(bones, name, to.clone().sub(from), hipSide.clone().lerp(shSide, t));
+    else drive(name, from, to);
+  };
+  twistDrive(B('Spine'),  hipCtr, sp1,         1 / 3);
+  twistDrive(B('Spine1'), sp1,    sp2,         2 / 3);
+  twistDrive(B('Spine2'), sp2,    shoulderCtr, 1);
+  // Head/neck. The neck runs up to the ears, the skull's centre line, and the
+  // top of the head points square to the ear→nose line, so the head nods with
+  // the face (forward at address, looking down at the ball) without leaning
+  // toward wherever the face points. Aimed at the mouth and then the nose, it
+  // leant the whole head ~30° toward the face — 50–60° from the top of the
+  // follow-through, the face side-on to the camera — so the rig's head stood
+  // out over the lead shoulder in the finish on TigerWoodsDriver.mov, where
+  // the golfer's sits upright over his shoulders.
+  if (earCtr && shoulderCtr) {
+    const neckDir = earCtr.clone().sub(shoulderCtr);
+    driveBone(bones, B('Neck'), neckDir);
+    const headUp = neckDir.clone();
+    if (lm0) {
+      const face = lm0.clone().sub(earCtr);
+      if (face.lengthSq() > 1e-8) headUp.projectOnPlane(face.normalize());
+    }
+    if (headUp.lengthSq() > 1e-8) driveBone(bones, B('Head'), headUp);
+  } else {
+    drive(B('Neck'),   shoulderCtr, mouthCtr);
+    drive(B('Head'),   mouthCtr,    lm0);
+  }
+
+  // Leg chains — after the 180° Y rotation the model's anatomical "Left" bone
+  // sits on the camera's LEFT = subject's RIGHT side, so drive it with the
+  // subject's RIGHT leg landmarks (lm24/26/28/30/32), and vice-versa. Driven
+  // before the arms so the body can be set down on the ground (below) before
+  // the club and hands are placed in world space.
+  drive(B('LeftUpLeg'), lm24, lm26);
+  drive(B('LeftLeg'),   lm26, lm28);
+  const flat = sceneObj.flatFootPitch || {};
+  const flatPitch = side => flat[side] || 0;
+  const footPose = side => (sceneObj.footPose && sceneObj.footPose[side][frameIdx]) || null;
+  const layLeft  = () => driveFootFlat(bones, 'Left',  lm30, lm32, lm28, flatPitch('Left'),  footPose('Left'));
+  const layRight = () => driveFootFlat(bones, 'Right', lm29, lm31, lm27, flatPitch('Right'), footPose('Right'));
+  layLeft();
+  drive(B('RightUpLeg'), lm23, lm25);
+  drive(B('RightLeg'),   lm25, lm27);
+  layRight();
+  if (!sceneObj.plantOff) {
+    const poles = sceneObj.kneePole && sceneObj.kneePole[frameIdx];
+    plantFeet(sceneObj, { Left: layLeft, Right: layRight }, poles || null);
+  }
+
+  // Clavicles — before the club, which is placed off the shoulder joints
+  // they leave the rig with. Then the chest and clavicles are corrected so the
+  // shoulder joints land where the video's are (see placeShoulders).
+  drive(B('LeftShoulder'),  shoulderCtr, lm12);
+  drive(B('RightShoulder'), shoulderCtr, lm11);
+  placeShoulders(bones, sceneObj.torsoFit, hipCtr, shoulderCtr, { Left: lm12, Right: lm11 }, armScale);
+
+  // ── Hand-on-club targets ──
+  // When a club is detected, both wrists are forced to converge on the grip
+  // (nudged slightly toward the curled-finger "tunnel", see gripWristTarget)
+  // and both hands rotate so their knuckle row wraps the shaft. This visually
+  // locks both hands onto the club. When no club is present, fall back to
+  // driving each forearm to its own wrist landmark.
+  let gripVec = null;
+  let shaftEndVec = null;
+  let shaftDir = null;
+  let handPoint = null;   // side → point on the shaft where that hand grips
+  let knuckleDir = null;  // side → which way that hand's knuckles face
+  let buttExtend = 0;     // how far the butt pokes out past the topmost hand
+  if (clubFrame && clubFrame.has_club && clubFrame.grip && clubFrame.shaft_end) {
+    const rawGrip = new THREE.Vector3(clubFrame.grip.x,      -clubFrame.grip.y,      -clubFrame.grip.z);
+    const rawEnd  = new THREE.Vector3(clubFrame.shaft_end.x, -clubFrame.shaft_end.y, -clubFrame.shaft_end.z);
+    const dir = rawEnd.clone().sub(rawGrip);
+    if (dir.lengthSq() > 1e-8) {
+      // How each hand is rolled around the shaft, measured from the video's
+      // own hand landmarks (see measuredKnuckleDir).
+      knuckleDir = {
+        Left:  measuredKnuckleDir(lm, 'Left',  lm14, lm16),
+        Right: measuredKnuckleDir(lm, 'Right', lm13, lm15),
+      };
+      // The club is hung off the RIG's shoulders, the same offset from them as
+      // from the video's. Placed in the landmarks' own coordinates it ignored
+      // that the rig's torso is built differently (its shoulder joints sit
+      // ~5 cm lower than MediaPipe's on TigerWoodsDriver.mov): as the torso
+      // turned, that gap swung the grip nearer and further from the rig's
+      // shoulders than the arms could follow, so the hands either fell off the
+      // club or the arms buckled to reach it. The offset and the club are
+      // sized to the rig by the same torso ratio as its shoulders and arms
+      // (see placeShoulders, clipArmScale) — at the golfer's own size they
+      // were ~11% too big for the rig's body, hanging the hands low at address
+      // and the club head well under the ground. Rendering only — the metrics
+      // use the club data as estimated.
+      const rigShoulders = bodyShoulderCentre(bones);
+      const k = sceneObj.torsoFit ? sceneObj.torsoFit.len : 1;
+      const shift = palmShift(knuckleDir);
+      if (rigShoulders && shoulderCtr) {
+        const offset = rawGrip.clone().sub(shoulderCtr).multiplyScalar(k);
+        rawGrip.copy(rigShoulders).add(offset);
+        dir.multiplyScalar(k);
+        rawEnd.copy(rawGrip).add(dir);
+      }
+      gripVec     = rawGrip.add(shift);
+      shaftEndVec = rawEnd.add(shift);
+      if (finish && finish.w) finish.fix = finishClubFix(bones, gripVec, shaftEndVec, finish.w, sceneObj.finishBack,
+                                                         clubFrame.screen_frac, clubFrame.grip_from_head);
+      else if (finish) {
+        // The hands turn with the club: the knuckles are measured against the
+        // landmarks' club, and left there while the shaft is tilted toward the
+        // camera they ended up pointing along it (173° on steelpwedge1.mov at
+        // 314), where the hand's roll round the shaft is undefined and the
+        // fists spun about it.
+        const before = shaftEndVec.clone().sub(gripVec).normalize();
+        applyClubFix(gripVec, shaftEndVec, finish);
+        const turn = new THREE.Quaternion().setFromUnitVectors(
+          before, shaftEndVec.clone().sub(gripVec).normalize());
+        ['Left', 'Right'].forEach(s => { if (knuckleDir[s]) knuckleDir[s].applyQuaternion(turn); });
+      }
+      shaftDir    = shaftEndVec.clone().sub(gripVec);
+      const shaftUnit = shaftDir.clone().normalize();
+      // Lead hand on top, trail hand directly below it (see gripHandPoints).
+      handPoint = gripHandPoints(gripVec, shaftUnit, sceneObj.leadSide);
+      // Butt cap: the club has to continue past whichever hand is highest on
+      // it, or the shaft appears to start inside the fists. Which hand that is
+      // comes from the data, so left- and right-handed golfers both work
+      // without being told which.
+      const topT = Math.min(
+        handPoint.Left.clone().sub(gripVec).dot(shaftUnit),
+        handPoint.Right.clone().sub(gripVec).dot(shaftUnit));
+      buttExtend = Math.max(0, -topT) + BUTT_CAP_M;
+    }
+  }
+  // Upper arms follow the landmarks directly (re-aimed at the grip below when
+  // there is a club). Rig "Left" takes the subject's RIGHT arm (see ARM_LM).
+  drive(B('LeftArm'),       lm12,        lm14);
+  drive(B('RightArm'),      lm11,        lm13);
+
+  // Hands wrap around the shaft: the knuckle-row axis (not the fingers'
+  // pointing direction) is aligned with the shaft, and fingers curl into a
+  // fist around it — see orientHandOnGrip / curlFingers. Falls back to an
+  // open hand driven toward the forearm→wrist landmark when no club is
+  // detected.
+  if (gripVec && shaftDir) {
+    // The forearm's rotation must be aimed from its own CURRENT world
+    // position, not the (slightly different, due to fixed rest-length
+    // mismatch) upper-arm landmark — orientHandOnGrip's stretch step below
+    // measures distance from that same actual position, and if the
+    // rotation were aimed from a different point the two would disagree on
+    // which direction is "toward the target", sending the stretched hand
+    // off at an angle instead of onto the grip.
+    const shaftUnit = shaftDir.clone().normalize();
+    // Through the finish the trail elbow points where the chest faces (see
+    // aimUpperArmAtGrip): square to the rig's shoulder line, on the side
+    // the subject's left shoulder (rig "Right", see ARM_LM) is to the left
+    // of.
+    let trailElbow = null;
+    if (finish && !finish.w && finish.up > 0) {
+      const subjL = bones[B('RightArm')], subjR = bones[B('LeftArm')];
+      if (subjL && subjR) {
+        const chest = subjL.getWorldPosition(new THREE.Vector3())
+          .sub(subjR.getWorldPosition(new THREE.Vector3()))
+          .cross(new THREE.Vector3(0, 1, 0));
+        if (chest.lengthSq() > 1e-8) trailElbow = { dir: chest.normalize(), k: finish.up };
+      }
+    }
+    ['Left', 'Right'].forEach(side => {
+      const wristTarget = gripWristTarget(side, handPoint[side], shaftDir, knuckleDir[side]);
+      const a = ARM_LM[side];
+      aimUpperArmAtGrip(bones, side, lm(a.shoulder), lm(a.elbow), lm(a.wrist), wristTarget, armScale,
+                        side === sceneObj.leadSide ? null : trailElbow);
+      driveForeArmToGrip(bones, side, wristTarget);
+      orientHandOnGrip(bones, side, handPoint[side], shaftDir, knuckleDir[side], armScale);
+      curlFingers(bones, side, 1);
+      layThumbAlongShaft(bones, side, handPoint[side], shaftUnit);
+    });
+  } else {
+    drive(B('LeftForeArm'),  lm14, lm16);
+    drive(B('RightForeArm'), lm13, lm15);
+    if (lm14 && lm16) drive(B('LeftHand'),  lm14, lm16);
+    if (lm13 && lm15) drive(B('RightHand'), lm13, lm15);
+    curlFingers(bones, 'Left',  0);
+    curlFingers(bones, 'Right', 0);
+    // Undo any forearm/hand stretch left over from a club-gripping frame.
+    resetForearmStretch(bones, 'Left', armScale);
+    resetForearmStretch(bones, 'Right', armScale);
+  }
+  // Note: hand pivots are already pinned to the grip (tunnel-offset-adjusted)
+  // inside orientHandOnGrip above — the arm/leg bone CHAINS above stay
+  // rotation-only so the rig's proportions (clavicle, spine, hip) are
+  // preserved; only the leaf HAND bones get their position overridden.
+
+  // Club shaft + head + swing trail. Drawn at the palm-shifted position worked
+  // out above so the rendered club is the same one the hands are gripping.
+  if (gripVec && shaftEndVec && shaftDir) {
+    const grip = gripVec;
+    const end  = shaftEndVec;
+    const len  = shaftDir.length();
+    const unit = shaftDir.clone().normalize();
+
+    // Start the shaft above the topmost hand (see buttExtend) so the club runs
+    // through the grip and out the top, instead of beginning inside the fists.
+    sceneObj.shaft.position.copy(grip).addScaledVector(unit, -buttExtend);
+    sceneObj.shaft.scale.set(1, len + buttExtend, 1);
+    sceneObj.shaft.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), unit);
+    sceneObj.shaft.visible = true;
+
+    sceneObj.clubhead.position.copy(end);
+    sceneObj.clubhead.visible = true;
+
+    // Trail
+    const tp = sceneObj.trailPositions;
+    if (sceneObj.trailCount < sceneObj.trailMax) {
+      const idx = sceneObj.trailCount;
+      tp[idx * 3] = end.x; tp[idx * 3 + 1] = end.y; tp[idx * 3 + 2] = end.z;
+      sceneObj.trailCount++;
+    } else {
+      for (let i = 0; i < (sceneObj.trailMax - 1) * 3; i++) tp[i] = tp[i + 3];
+      const last = (sceneObj.trailMax - 1) * 3;
+      tp[last] = end.x; tp[last + 1] = end.y; tp[last + 2] = end.z;
+    }
+    sceneObj.trail.geometry.attributes.position.needsUpdate = true;
+    sceneObj.trail.geometry.setDrawRange(0, Math.min(sceneObj.trailCount, sceneObj.trailMax));
+  } else {
+    sceneObj.shaft.visible = false;
+    sceneObj.clubhead.visible = false;
+  }
+
+  // Push driven bone matrices into SkinnedMesh GPU skinning buffers
+  model.traverse(obj => {
+    if (obj.isSkinnedMesh) obj.skeleton.update();
+  });
+}
+
+// ── Phase color → tint Soldier's SkinnedMesh materials ──
+function applyPhaseColor(sceneObj, frameIdx, phases = phaseData, updateBadge = true) {
+  let phaseColor = 0x4ade80;
+  for (const [phase, range] of Object.entries(phases)) {
+    if (frameIdx >= range.start && frameIdx <= range.end) {
+      phaseColor = parseInt((phaseColors[phase] || '#4ade80').replace('#', ''), 16);
+      if (!updateBadge) break;
+      phaseBadge.textContent = phase;
+      phaseBadge.style.background = phaseColors[phase] + '26';
+      phaseBadge.style.color = phaseColors[phase];
+      phaseBadge.style.border = '1px solid ' + phaseColors[phase] + '4d';
+      break;
+    }
+  }
+  if (sceneObj.soldierModel) {
+    sceneObj.soldierModel.traverse(obj => {
+      if ((obj.isMesh || obj.isSkinnedMesh) && obj.material) {
+        obj.material.color.setHex(phaseColor);
+      }
+    });
+  }
+}
+
+// Map student frame to pro frame. The two clips have their own lengths and
+// swing timing, so anchor the matching phase boundaries of both swings (and
+// the DTW-matched midpoint inside each phase) and interpolate between them.
+// dtwAlignment holds [studentMid, proMid, dist] per phase, not a pro range.
+function buildComparisonAnchors() {
+  const last = comparisonPose.length - 1;
+  const anchors = [[0, 0], [TOTAL - 1, last]];
+  for (const [phase, sRange] of Object.entries(phaseData)) {
+    const pRange = comparisonPhaseData[phase];
+    if (!pRange) continue;
+    anchors.push([sRange.start, pRange.start], [sRange.end, pRange.end]);
+    const a = dtwAlignment && dtwAlignment[phase];
+    if (a && a[0] > sRange.start && a[0] < sRange.end
+          && a[1] > pRange.start && a[1] < pRange.end) {
+      anchors.push([a[0], a[1]]);
+    }
+  }
+  anchors.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  // Keep the mapping monotonic so the pro never plays backwards.
+  const out = [];
+  for (const [s, p] of anchors) {
+    const pc = Math.min(Math.max(p, 0), last);
+    const prev = out[out.length - 1];
+    if (prev && (s <= prev[0] || pc < prev[1])) continue;
+    out.push([s, pc]);
+  }
+  return out;
+}
+const comparisonAnchors = isComparison ? buildComparisonAnchors() : [];
+
+function getComparisonFrame(studentFrameIdx) {
+  const last = comparisonPose.length - 1;
+  const A = comparisonAnchors;
+  for (let i = 1; i < A.length; i++) {
+    if (studentFrameIdx <= A[i][0]) {
+      const [s0, p0] = A[i - 1];
+      const [s1, p1] = A[i];
+      const t = (s1 > s0) ? (studentFrameIdx - s0) / (s1 - s0) : 0;
+      return Math.min(Math.max(Math.round(p0 + t * (p1 - p0)), 0), last);
+    }
+  }
+  const ratio = studentFrameIdx / Math.max(TOTAL - 1, 1);
+  return Math.min(Math.round(ratio * last), last);
+}
+
+// ── Controls ──
+const playBtn     = document.getElementById('play-btn');
+const scrubber    = document.getElementById('scrubber');
+const frameLabel  = document.getElementById('frame-label');
+const phaseBadge  = document.getElementById('phase-badge');
+const speedSelect = document.getElementById('speed-select');
+const resetCamBtn = document.getElementById('reset-cam-btn');
+
+scrubber.max = TOTAL - 1;
+let currentFrame = 0;
+let playing = false;
+let playbackSpeed = 1.0;
+let lastTime = 0;
+let accumulator = 0;
+
+const fps = (TOTAL > 1 && poseData[1].timestamp_ms > 0)
+  ? 1000 / (poseData[1].timestamp_ms - poseData[0].timestamp_ms) : 30;
+
+playBtn.addEventListener('click', () => {
+  playing = !playing;
+  playBtn.textContent = playing ? 'Pause' : 'Play';
+  if (playing) { lastTime = performance.now(); accumulator = 0; }
+});
+
+scrubber.addEventListener('input', () => {
+  currentFrame = parseInt(scrubber.value);
+  resetTrail(mainScene);
+  if (compScene) resetTrail(compScene);
+});
+
+speedSelect.addEventListener('change', () => {
+  playbackSpeed = parseFloat(speedSelect.value);
+});
+
+resetCamBtn.addEventListener('click', () => {
+  camera.position.set(...CAM_POS);
+  controls.target.set(...CAM_TARGET);
+  controls.update();
+  if (camera2) {
+    camera2.position.set(...CAM_POS);
+    controls2.target.set(...CAM_TARGET);
+    controls2.update();
+  }
+});
+
+function resetTrail(sceneObj) {
+  sceneObj.trailCount = 0;
+  sceneObj.trail.geometry.setDrawRange(0, 0);
+}
+
+// ── Animation loop (started after GLB loads) ──
+function animate(time) {
+  requestAnimationFrame(animate);
+
+  if (playing) {
+    const dt = (time - lastTime) / 1000;
+    lastTime = time;
+    accumulator += dt * playbackSpeed * fps;
+    if (accumulator >= 1) {
+      const step = Math.floor(accumulator);
+      currentFrame = (currentFrame + step) % TOTAL;
+      accumulator -= step;
+    }
+  }
+
+  const fi = Math.floor(currentFrame);
+
+  updateSkeleton(mainScene, poseData[fi], clubData[fi], mainScene.finishFix[fi], fi);
+  applyPhaseColor(mainScene, fi);
+
+  scrubber.value = fi;
+  frameLabel.textContent = `${fi} / ${TOTAL - 1}`;
+
+  controls.update();
+
+  if (isComparison) {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    const halfW = Math.floor(w / 2);
+
+    const compIdx = getComparisonFrame(fi);
+    updateSkeleton(compScene, comparisonPose[compIdx], comparisonClub[compIdx], compScene.finishFix[compIdx],
+                   compIdx);
+    applyPhaseColor(compScene, compIdx,
+      Object.keys(comparisonPhaseData).length ? comparisonPhaseData : phaseData, false);
+
+    renderer.setScissorTest(true);
+
+    renderer.setViewport(0, 0, halfW, h);
+    renderer.setScissor(0, 0, halfW, h);
+    camera.aspect = halfW / h;
+    camera.updateProjectionMatrix();
+    renderer.render(mainScene.scene, camera);
+
+    renderer.setViewport(halfW, 0, w - halfW, h);
+    renderer.setScissor(halfW, 0, w - halfW, h);
+    camera2.aspect = (w - halfW) / h;
+    camera2.updateProjectionMatrix();
+    renderer.render(compScene.scene, camera2);
+
+    renderer.setScissorTest(false);
+    controls2.update();
+  } else {
+    renderer.render(mainScene.scene, camera);
+  }
+}
+
+// Handle resize
+window.addEventListener('resize', () => {
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  renderer.setSize(w, h);
+  if (!isComparison) {
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+});
+</script>
+</body>
+</html>
